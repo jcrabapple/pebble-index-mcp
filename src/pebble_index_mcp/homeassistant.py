@@ -237,6 +237,32 @@ class HAClient:
             return f"{friendly} is {pre_state}."
         return f"{friendly} did not respond (state: {pre_state})."
 
+    def announce(self, message: str) -> str:
+        """Speak a message on every live assist_satellite (Voice PE).
+
+        HA returns 200 for announce even when the device is offline, so the
+        live-entity precheck IS the verification; there is no state readback
+        for an announcement.
+        """
+        message = message.strip()
+        if not message:
+            raise HAError("Empty message.")
+        states = self._get("/api/states")
+        live = [
+            s["entity_id"]
+            for s in states
+            if s["entity_id"].startswith("assist_satellite.")
+            and s["state"] not in _BAD_STATES
+        ]
+        if not live:
+            raise HAError("No available speaker to announce on.")
+        self._post(
+            "/api/services/assist_satellite/announce",
+            {"entity_id": live, "message": message, "preannounce": True},
+        )
+        noun = "speaker" if len(live) == 1 else "speakers"
+        return f"Announced on {len(live)} {noun}."
+
 
 def _safe_json(r: httpx.Response) -> Any:
     try:

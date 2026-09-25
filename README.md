@@ -11,6 +11,8 @@ and the answer comes back as a phone notification.
 [Index ring] → [Pebble app] → [Pebble cloud agent] → [this MCP server]
                                                         ├─ vault tools (local files)
                                                         ├─ ha_control → Home Assistant REST API
+                                                        ├─ ha_announce → assist_satellite.announce
+                                                        ├─ vinyl_lookup → vinyl catalog API
                                                         └─ ask_hermes → Hermes API server
 ```
 
@@ -28,8 +30,9 @@ and the answer comes back as a phone notification.
 | `src/pebble_index_mcp/vault.py` | `Vault`: path-sandboxed read/append + ripgrep search over the vault. All paths resolve inside the vault root; absolute paths, `..` traversal, and symlink escapes are rejected. Appends are append-only, timestamped, and never overwrite. |
 | `src/pebble_index_mcp/hermes.py` | `HermesClient`: forwards questions to an OpenAI-compatible chat completions endpoint with a short-answer system hint. Maps timeouts/transport failures/bad shapes onto `HermesTimeout`/`HermesError`. |
 | `src/pebble_index_mcp/websearch.py` | `ExaClient`: live web search against the Exa API, snippets truncated locally. Errors map to `ExaError`; a missing key short-circuits with a clear message. |
-| `src/pebble_index_mcp/homeassistant.py` | `HAClient`: deterministic smart-home commands against the Home Assistant REST API. Parses the action from the command text, resolves the target entity by token match (preferring room group entities over individual fixtures and available over unavailable entities), calls the service, then polls the state readback to confirm. No LLM in the loop. |
-| `src/pebble_index_mcp/server.py` | FastMCP app: registers the six tools and the `ring_persona` prompt, wraps the streamable-http app in bearer auth (constant-time compare) and configures host allow-listing. |
+| `src/pebble_index_mcp/homeassistant.py` | `HAClient`: deterministic smart-home commands against the Home Assistant REST API. Parses the action from the command text, resolves the target entity by token match (preferring room group entities over individual fixtures and available over unavailable entities), calls the service, then polls the state readback to confirm. No LLM in the loop. Also `announce()`: intercom messages to every live `assist_satellite` (offline satellites are pre-filtered because HA returns 200 for announce regardless). |
+| `src/pebble_index_mcp/vinyl.py` | `VinylClient`: lookups against the operator's self-hosted vinyl catalog API. Routes command text to a random pick, most-played list, or artist/album search; conversational filler is stripped before the catalog's full-text query. Base URL is operator config only. |
+| `src/pebble_index_mcp/server.py` | FastMCP app: registers the eight tools and the `ring_persona` prompt, wraps the streamable-http app in bearer auth (constant-time compare) and configures host allow-listing. |
 
 ## Tools
 
@@ -38,6 +41,8 @@ and the answer comes back as a phone notification.
 - `vault_append(note_path, text)` — appends a timestamped `- HH:MM text` line, creating the note if needed.
 - `ask_hermes(question)` — forwards to the Hermes API server; 60s timeout with an honest acknowledgment on miss.
 - `ha_control(command)` — smart-home commands: `"living room lights on"`, `"bedroom off"`, `"toggle the hallway"`, `"is the living room tv on"`. Resolves the entity against Home Assistant's state list (room groups win over individual fixtures; ambiguous matches return the candidates instead of guessing), calls the service, and polls the state readback so the confirmation reflects the NEW state. Domains: light, switch, fan, cover, media_player. Requires `HASS_TOKEN`. Milliseconds-to-seconds latency; never route smart-home commands through `ask_hermes`.
+- `ha_announce(message)` — intercom: speaks `message` on every live `assist_satellite` device with a pre-announce chime. Offline satellites are skipped (HA returns 200 for announce even when the device is down, so the tool pre-filters). Requires `HASS_TOKEN`.
+- `vinyl_lookup(command)` — queries the operator's self-hosted vinyl catalog: owned-record search ("do I own Eternal Blue"), a dormancy-weighted random pick, or most-played records. Requires `VINYL_URL`.
 - `web_search(query, max_results=3)` — live web search via the Exa API, composed into a short spoken answer by the configured model. Requires `EXA_API_KEY`.
 
 Both answer tools wrap their result in the Pebble app's private `coreSchema` contract (`_meta: {"coreSchema": 1}` plus `structuredContent` carrying a `Response` semantic result). Without it, the app's completion notification shows the transcription of the question instead of the answer. If the compose step fails, `web_search` falls back to raw results (the notification then shows the question; the agent still answers in the feed).
@@ -64,8 +69,9 @@ Both answer tools wrap their result in the Pebble app's private `coreSchema` con
 | `HERMES_API_KEY` | — | API server bearer key |
 | `RING_MODEL` | `pebble-ring` | Model alias sent upstream (map it to a cheap model via the API server's `model_routes`) |
 | `EXA_API_KEY` | — | Exa API key for `web_search`; without it the tool reports an error but the rest of the server works |
-| `HASS_URL` | `http://127.0.0.1:8123` | Home Assistant base URL for `ha_control` |
-| `HASS_TOKEN` | — | Home Assistant long-lived access token for `ha_control`; without it the tool reports an error but the rest of the server works |
+| `HASS_URL` | `http://127.0.0.1:8123` | Home Assistant base URL for `ha_control` / `ha_announce` |
+| `HASS_TOKEN` | — | Home Assistant long-lived access token for `ha_control` / `ha_announce`; without it those tools report an error but the rest of the server works |
+| `VINYL_URL` | — | Base URL of a vinyl catalog API exposing `GET /api/records?q=`, `GET /api/random`, `GET /api/plays/top` for `vinyl_lookup`; without it the tool reports an error but the rest of the server works |
 | `RING_PERSONA_FILE` | — | Optional path to a text file replacing the generic cloud-agent persona |
 
 `HERMES_API_URL` accepts any OpenAI-compatible chat completions endpoint, so

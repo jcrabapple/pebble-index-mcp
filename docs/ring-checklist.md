@@ -41,6 +41,10 @@ changes before retesting.
 | "Is the hallway light on" | ha_control status; "Hallway: on." | ☐ |
 | "Lights on" (no room) | ha_control asks which room (ambiguity candidates) | ☐ |
 | "Turn on the garage lights" | ha_control: "No device matches" (honest miss) | ☐ |
+| "Tell the house dinner is ready" | ha_announce; pre-announce chime then the message on the Voice PE | ☐ |
+| "Do I own Eternal Blue by Spiritbox" | vinyl_lookup; "You own it: ..." with pressing count | ☐ |
+| "Pick a random record" | vinyl_lookup; dormancy-weighted pick | ☐ |
+| "What are my most played records" | vinyl_lookup; top plays with counts | ☐ |
 | Single click: "remind me to call the dentist tomorrow" | Native reminder (Pebble app), nothing in vault | ☐ |
 | Speak a secret/private thought on single click | Stays on-device; nothing hits the MCP server (check its logs) | ☐ |
 

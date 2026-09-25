@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse
 from .hermes import HermesClient, HermesError, HermesTimeout
 from .homeassistant import HAClient, HAError
 from .vault import Vault, VaultAccessError
+from .vinyl import VinylClient, VinylError
 from .websearch import ExaClient, ExaError
 
 logger = logging.getLogger("pebble_index_mcp")
@@ -45,6 +46,9 @@ HA = HAClient(
 )
 if not HA.token:
     logger.warning("HASS_TOKEN is not set; ha_control will report an error")
+VINYL = VinylClient(url=os.environ.get("VINYL_URL", "").strip())
+if not VINYL.url:
+    logger.warning("VINYL_URL is not set; vinyl_lookup will report an error")
 
 # DNS-rebinding protection: allow loopback plus any hosts named in
 # MCP_ALLOWED_HOSTS (comma-separated). The public tunnel hostname goes there.
@@ -194,6 +198,38 @@ def ha_control(command: str) -> CallToolResult:
     try:
         text = HA.control(command)
     except HAError as e:
+        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+    return _spoken_response(text, question=command)
+
+
+@mcp.tool()
+def ha_announce(message: str) -> CallToolResult:
+    """Make a spoken announcement on the house speaker(s), like an intercom.
+
+    Use when the user says "tell everyone ...", "announce ...", or "tell the
+    house ...". message is ONLY the words to speak, with the routing phrase
+    stripped (for "tell the house dinner is ready", message is "dinner is
+    ready"). Keep it short. Returns the number of speakers it played on."""
+    try:
+        text = HA.announce(message)
+    except HAError as e:
+        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+    return _spoken_response(text, question=message)
+
+
+@mcp.tool()
+def vinyl_lookup(command: str) -> CallToolResult:
+    """Look things up in the user's vinyl record catalog.
+
+    Use when the user asks whether they own a record (essential before
+    buying a duplicate at a record store), wants a random record to spin,
+    or asks for their most-played records. command is the spoken request in
+    plain text, e.g. "do I own Eternal Blue by Spiritbox", "pick a random
+    record", "most played records this year". Returns what they own,
+    including pressing counts."""
+    try:
+        text = VINYL.lookup(command)
+    except VinylError as e:
         return CallToolResult(content=[TextContent(type="text", text=str(e))])
     return _spoken_response(text, question=command)
 

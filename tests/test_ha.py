@@ -216,6 +216,50 @@ def test_control_no_state_change_reports_honestly(monkeypatch):
     assert "did not respond" in out
 
 
+def _sat(entity_id, state="idle"):
+    return {"entity_id": entity_id, "state": state, "attributes": {"friendly_name": entity_id}}
+
+
+def test_announce_targets_only_live_satellites(monkeypatch):
+    c = _client()
+    states = [
+        _sat("assist_satellite.one", "idle"),
+        _sat("assist_satellite.two", "unavailable"),
+    ]
+    posts = []
+
+    def fake_get(path):
+        return states
+
+    def fake_post(path, payload):
+        posts.append((path, payload))
+        return []
+
+    monkeypatch.setattr(c, "_get", fake_get)
+    monkeypatch.setattr(c, "_post", fake_post)
+    out = c.announce("dinner is ready")
+    assert posts[0][0] == "/api/services/assist_satellite/announce"
+    assert posts[0][1]["entity_id"] == ["assist_satellite.one"]
+    assert posts[0][1]["message"] == "dinner is ready"
+    assert posts[0][1]["preannounce"] is True
+    assert "1 speaker" in out
+
+
+def test_announce_no_live_satellite(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(
+        c, "_get",
+        lambda path: [_sat("assist_satellite.dead", "unavailable")],
+    )
+    with pytest.raises(HAError):
+        c.announce("hello")
+
+
+def test_announce_empty_message(monkeypatch):
+    with pytest.raises(HAError):
+        _client().announce("   ")
+
+
 def test_control_status_never_posts(monkeypatch):
     c = _client()
     fake = FakeHA(_states())
