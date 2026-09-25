@@ -25,6 +25,7 @@ def _states():
         _state("light.bedroom_bedroom", "Bedroom", "unavailable"),
         _state("light.bedroom_bedroom_2", "Bedroom"),
         _state("light.storage_closet_storage_closet", "Storage Closet"),
+        _state("light.jason_s_lamp", "Jason's lamp"),
         _state("media_player.living_room_tv_2", "Living Room TV", "paused"),
         _state("switch.home_assistant_voice_09f284_mute", "Home Assistant Voice Mute"),
     ]
@@ -102,6 +103,29 @@ def test_resolve_specific_lamp_beats_group():
 def test_resolve_skips_unavailable_duplicate():
     entity = _resolve(_client(), ["bedroom", "light"])
     assert entity["entity_id"] == "light.bedroom_bedroom_2"
+
+
+def test_parse_possessive_splits_apostrophe():
+    # "jason's" must tokenize as jason/s, not a dead "jason's" token that
+    # singularize() mangles into "jason'"
+    action, target = parse_command("turn on Jason's lamp")
+    assert action == "on"
+    assert target == ["jason", "lamp"]
+
+
+def test_resolve_possessive_entity():
+    entity = _resolve(_client(), ["jason", "lamp"])
+    assert entity["entity_id"] == "light.jason_s_lamp"
+
+
+def test_control_possessive_end_to_end(monkeypatch):
+    c = _client()
+    fake = FakeHA(_states())
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.control("turn on Jason's lamp")
+    assert fake.posts[0][1] == {"entity_id": "light.jason_s_lamp"}
+    assert "now on" in out
 
 
 def test_resolve_media_player():

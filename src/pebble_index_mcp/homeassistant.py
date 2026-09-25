@@ -48,7 +48,9 @@ def _singular(word: str) -> str:
 
 def parse_command(text: str) -> tuple[str, list[str]]:
     """Return (action, target_tokens) from a plain-text command."""
-    t = re.sub(r"[^a-z0-9' ]+", " ", text.lower()).strip()
+    # Apostrophes become separators so "jason's" matches the entity_id
+    # tokenization ("jason", "s", "lamp") instead of a dead "jason's" token.
+    t = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
     if not t:
         raise HAError("Empty command.")
     if _STATUS_RE.search(t) or re.match(r"^(is|are|what)\b", t):
@@ -72,7 +74,7 @@ def _target_tokens(phrase: str) -> list[str]:
 
 def _text_tokens(entity_id: str, friendly: str) -> set[str]:
     raw = f"{entity_id.replace('_', ' ').replace('.', ' ')} {friendly.lower()}"
-    return {w for w in re.split(r"[^a-z0-9']+", raw) if w}
+    return {w for w in re.split(r"[^a-z0-9]+", raw) if w}
 
 
 class HAClient:
