@@ -1,0 +1,6 @@
+tunnel: pebble-index
+credentials-file: /home/<user>/.cloudflared/<tunnel-uuid>.json
+ingress:
+  - hostname: <public-hostname>
+    service: http://127.0.0.1:8765
+  - service: http_status:404

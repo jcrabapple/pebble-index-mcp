@@ -1,0 +1,31 @@
+[project]
+name = "pebble-index-mcp"
+version = "0.1.0"
+description = "MCP bridge exposing the Obsidian vault and Hermes to the Pebble Index 01 ring"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    # mcp is pinned: server.py registers prompts on the low-level server
+    # (mcp._mcp_server) to emit a null `arguments` field, which the Pebble
+    # app's client requires. The private API is only guaranteed at 1.29.0;
+    # bump deliberately and re-run test_prompts_list_arguments_null.
+    "mcp==1.29.0",
+    "httpx>=0.27",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

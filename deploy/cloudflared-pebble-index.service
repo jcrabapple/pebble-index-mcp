@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare Tunnel for Pebble Index MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --config %h/.cloudflared/pebble-index.yml run pebble-index
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

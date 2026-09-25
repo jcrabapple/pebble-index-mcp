@@ -1,0 +1,24 @@
+[Unit]
+Description=Pebble Index MCP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/pebble-index-mcp
+# EnvironmentFile (required) provides MCP_BEARER_TOKEN, VAULT_PATH,
+# HERMES_API_KEY, and friends. Missing file = unit fails to start, by design.
+EnvironmentFile=%h/.config/pebble-index-mcp/env
+ExecStart=%h/projects/pebble-index-mcp/.venv/bin/python -m pebble_index_mcp.server
+Restart=on-failure
+RestartSec=5
+# Hardening: this process holds a bearer token and read/write access to the
+# vault. It needs no privileges, only loopback + outbound to the Hermes API.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths="%h/Documents/Obsidian Vault"
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
