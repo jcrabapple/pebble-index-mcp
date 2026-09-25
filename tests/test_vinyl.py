@@ -32,11 +32,68 @@ def _client():
 
 # --- command routing / query cleanup ---------------------------------------
 
-def test_search_terms_strip_conversational_filler():
+def test_search_terms_keeps_raw_words():
     c = _client()
-    assert c._search_terms("do I own Eternal Blue by Spiritbox") == "eternal blue spiritbox"
-    assert c._search_terms("random record") == ""
-    assert c._search_terms("   ") == ""
+    assert c._search_terms("do I own Eternal Blue by Spiritbox") == [
+        "eternal", "blue", "spiritbox",
+    ]
+    assert c._search_terms("random record") == []
+    assert c._search_terms("   ") == []
+
+
+def test_fts_query_uses_prefixes_not_stripping():
+    c = _client()
+    # Plural stripping corrupts non-plural words (crisis -> crisi); FTS5
+    # prefix queries handle both without touching the word.
+    assert c._fts_query(["identity", "crisis", "thrice"]) == "identity* crisi* thrice*"
+    assert c._fts_query(["bodies", "thornhill"]) == "bodie* thornhill*"
+    assert c._fts_query(["lights"]) == "light*"
+
+
+def test_lookup_search_found(monkeypatch):
+    c = _client()
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(url)
+        return 200, [_album(count=2)]
+
+    monkeypatch.setattr(c, "_get_raw", fake_get)
+    out = c.lookup("do I own Eternal Blue")
+    assert "/api/records" in calls[0] and "eternal%2A" in calls[0]
+    assert "You own it" in out and "2 pressings" in out
+
+
+def test_lookup_regressions_crisis_and_bodies(monkeypatch):
+    # Both of these returned false "do not own" misses on 2026-09-25 because
+    # singularize() mangled crisis/bodies before the FTS query.
+    c = _client()
+    urls = []
+
+    def fake_get(url, **kw):
+        urls.append(url)
+        return 200, [_album("Thrice", "Identity Crisis", 2025)]
+
+    monkeypatch.setattr(c, "_get_raw", fake_get)
+    out = c.lookup("do I own Identity Crisis by Thrice?")
+    assert "crisi%2A" in urls[0]
+    assert "You own it" in out and "Identity Crisis" in out
+
+    monkeypatch.setattr(
+        c, "_get_raw", lambda url, **kw: urls.append(url) or (
+            200, [_album("Thornhill", "Bodies: Definitive", 2026)]
+        )
+    )
+    out = c.lookup("Do I own Bodies by Thornhill?")
+    assert "bodie%2A" in urls[1]
+    assert "You own it" in out
+
+
+def test_lookup_no_match_shows_raw_words(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(c, "_get_raw", lambda url, **kw: (200, []))
+    out = c.lookup("do I own Identity Crisis")
+    assert "identity crisis" in out
 
 
 def test_lookup_routes_random(monkeypatch):
@@ -68,20 +125,6 @@ def test_lookup_routes_top_plays(monkeypatch):
     out = c.lookup("what are my most played records")
     assert any("/api/plays/top" in u for u in calls)
     assert "Bilmuri" in out and "12 plays" in out
-
-
-def test_lookup_search_found(monkeypatch):
-    c = _client()
-    calls = []
-
-    def fake_get(url, **kw):
-        calls.append(url)
-        return 200, [_album(count=2)]
-
-    monkeypatch.setattr(c, "_get_raw", fake_get)
-    out = c.lookup("do I own Eternal Blue")
-    assert "/api/records" in calls[0] and "eternal+blue" in calls[0]
-    assert "You own it" in out and "2 pressings" in out
 
 
 def test_lookup_search_multiple(monkeypatch):

@@ -58,10 +58,18 @@ class VinylClient:
 
     # -- command routing ------------------------------------------------------
 
-    def _search_terms(self, command: str) -> str:
+    def _search_terms(self, command: str) -> list[str]:
+        # Keep RAW words for display; plural/possessive tolerance comes from
+        # FTS5 prefix queries (see _fts_query), never from stripping letters.
         words = re.sub(r"[^a-z0-9 ]+", " ", command.lower()).split()
-        terms = [_singular(w) for w in words if w not in _SEARCH_FILLER]
-        return " ".join(terms)
+        return [w for w in words if w not in _SEARCH_FILLER]
+
+    @staticmethod
+    def _fts_query(terms: list[str]) -> str:
+        # "crisis" -> "crisi*": matches crisis/crises; "bodies" -> "bodie*"
+        # matches "bodies". Stripping an s would corrupt non-plural words
+        # (crisis -> crisi) and FTS5 has no stemmer, so prefix instead.
+        return " ".join(_singular(t) + "*" for t in terms)
 
     def lookup(self, command: str) -> str:
         """Route one lookup command and return a short spoken result."""
@@ -81,11 +89,13 @@ class VinylClient:
 
     # -- modes ----------------------------------------------------------------
 
-    def _search(self, terms: str) -> str:
-        path = "/api/records?" + str(httpx.QueryParams({"q": terms, "limit": "100"}))
+    def _search(self, terms: list[str]) -> str:
+        path = "/api/records?" + str(
+            httpx.QueryParams({"q": self._fts_query(terms), "limit": "100"})
+        )
         albums = self._get(path)
         if not isinstance(albums, list) or not albums:
-            return f"You do not own anything matching '{terms}'."
+            return f"You do not own anything matching '{' '.join(terms)}'."
         lines = [
             _album_line(a) for a in albums[:_MAX_RESULTS]
         ]
