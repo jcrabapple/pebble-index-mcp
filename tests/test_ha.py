@@ -153,6 +153,7 @@ class FakeHA:
         self.states = states
         self.posts = []
         self.apply = apply
+        self.play_queue = []
 
     def get(self, url, headers=None, timeout=None):
         if url.endswith("/api/states") or "/api/states/" in url:
@@ -167,12 +168,19 @@ class FakeHA:
 
     def post(self, url, json=None, headers=None, timeout=None):
         self.posts.append((url, json))
-        # Apply the state change like HA would, so the verify readback in
-        # control() sees the new state.
+        if not self.apply:
+            return 200, []
         service = url.rsplit("/", 2)[1:]
-        if len(service) == 2 and self.apply and json and "entity_id" in json:
+        if len(service) == 2 and json and "entity_id" in json:
             domain, svc = service
             eid = json["entity_id"]
+            if svc == "play_media":
+                attrs = self.play_queue.pop(0) if self.play_queue else {}
+                for s in self.states:
+                    if s["entity_id"] == eid:
+                        s["state"] = "playing"
+                        s["attributes"].update(attrs)
+                return 200, []
             new_state = {
                 "turn_on": "on",
                 "turn_off": "off",
@@ -258,6 +266,106 @@ def test_announce_no_live_satellite(monkeypatch):
 def test_announce_empty_message(monkeypatch):
     with pytest.raises(HAError):
         _client().announce("   ")
+
+
+# --- music (Music Assistant via HA) -----------------------------------------
+
+def _mu_state(entity_id, state="idle", **attrs):
+    return {"entity_id": entity_id, "state": state, "attributes": attrs}
+
+
+def _music_states():
+    return [
+        _mu_state("media_player.home_assistant_voice_09f284"),
+        _mu_state("media_player.basement_speaker_1_2"),
+        _mu_state("media_player.clarity_s_vinyl_speaker_2"),
+        _mu_state("media_player.kitchen_display_2"),
+        _mu_state("media_player.sydney_s_room_speaker_2"),
+        _mu_state("media_player.master_bedroom_speaker_2", "unavailable"),
+    ]
+
+
+def test_music_play_default_player_and_verify(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    fake.play_queue = [{"media_title": "Circle With Me", "media_artist": "Spiritbox"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play Spiritbox")
+    url, payload = fake.posts[0]
+    assert url == "/api/services/media_player/play_media"
+    assert payload["entity_id"] == "media_player.home_assistant_voice_09f284"
+    assert payload["media_content_type"] == "artist"
+    assert payload["media_content_id"] == "spiritbox"
+    assert "Circle With Me" in out and "Spiritbox" in out
+
+
+def test_music_room_routing_and_possessive(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    fake.play_queue = [{"media_title": "Casanova Fluid Hair"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    c.music("play Bilmuri in the basement")
+    assert fake.posts[0][1]["entity_id"] == "media_player.basement_speaker_1_2"
+    c.music("play Bilmuri in Sydney's room")
+    assert fake.posts[-1][1]["entity_id"] == "media_player.sydney_s_room_speaker_2"
+
+
+def test_music_album_and_track_types(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    fake.play_queue = [{"media_title": "Blue Rev"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    c.music("play the album Blue Rev in the kitchen")
+    assert fake.posts[0][1]["media_content_type"] == "album"
+    fake.play_queue = [{"media_title": "Granite", "media_artist": "Sleep Token"}]
+    c.music("play the song Granite")
+    assert fake.posts[-1][1]["media_content_type"] == "track"
+
+
+def test_music_falls_back_to_track_when_artist_empty(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    # First attempt (artist) yields no title; second (track) succeeds.
+    fake.play_queue = [{}, {"media_title": "Granite", "media_artist": "Sleep Token"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play Granite")
+    types = [p[1]["media_content_type"] for p in fake.posts]
+    assert types == ["artist", "track"]
+    assert "Granite" in out
+
+
+def test_music_stop(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("stop the music in the basement")
+    assert fake.posts[0][0] == "/api/services/media_player/media_stop"
+    assert fake.posts[0][1]["entity_id"] == "media_player.basement_speaker_1_2"
+    assert "topped" in out
+
+
+def test_music_unavailable_player(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    with pytest.raises(HAError):
+        c.music("play Spiritbox in the bedroom")
+
+
+def test_music_unknown_room(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    with pytest.raises(HAError) as exc:
+        c.music("play Spiritbox on the porch")
+    assert "basement" in str(exc.value)
 
 
 def test_control_status_never_posts(monkeypatch):

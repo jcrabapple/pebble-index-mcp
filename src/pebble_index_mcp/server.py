@@ -234,6 +234,21 @@ def vinyl_lookup(command: str) -> CallToolResult:
     return _spoken_response(text, question=command)
 
 
+@mcp.tool()
+def ha_music(command: str) -> CallToolResult:
+    """Play or stop music on the house speakers (Deezer via Music Assistant).
+
+    Use for requests like "play Spiritbox in the basement", "play the album
+    Blue Rev in the kitchen", "play the song Granite", or "stop the music in
+    the living room". command is the spoken request. No room named means the
+    Voice PE speaker. Verifies playback started and returns what is playing."""
+    try:
+        text = HA.music(command)
+    except HAError as e:
+        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+    return _spoken_response(text, question=command)
+
+
 _GENERIC_PERSONA = (
     "You are a voice assistant answering through a Pebble Index smart ring. "
     "The user's Obsidian vault lives at the vault root.\n"

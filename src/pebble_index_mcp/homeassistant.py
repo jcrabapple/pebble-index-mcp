@@ -263,6 +263,125 @@ class HAClient:
         noun = "speaker" if len(live) == 1 else "speakers"
         return f"Announced on {len(live)} {noun}."
 
+    # -- music (Music Assistant players surfaced as media_player.*_2) --------
+
+    # (spoken key, entity_id). Longest keys first so "master bedroom" wins
+    # over "bedroom". Keys are apostrophe-free; commands are normalized the
+    # same way before matching.
+    _MUSIC_ROOMS = [
+        ("master bedroom", "media_player.master_bedroom_speaker_2"),
+        ("kids bathroom", "media_player.kids_bathroom_speaker_2"),
+        ("sydneys room", "media_player.sydney_s_room_speaker_2"),
+        ("clarities room", "media_player.clarity_s_room_speaker_2"),
+        ("workout room", "media_player.workout_room_2"),
+        ("living room", "media_player.clarity_s_vinyl_speaker_2"),
+        ("basement", "media_player.basement_speaker_1_2"),
+        ("bedroom", "media_player.master_bedroom_speaker_2"),
+        ("kitchen", "media_player.kitchen_display_2"),
+        ("foyer", "media_player.foyer_speaker_2"),
+        ("office", "media_player.jason_s_office_display_2"),
+        ("gym", "media_player.workout_room_2"),
+        ("voice pe", "media_player.home_assistant_voice_09f284"),
+    ]
+    _DEFAULT_PLAYER = "media_player.home_assistant_voice_09f284"
+    _GENERIC_PLACES = {"speaker", "speakers", "here", "house", "everywhere", "the house"}
+
+    @classmethod
+    def _clean_command(cls, command: str) -> str:
+        s = command.lower().replace("'", "")
+        s = re.sub(r"[^a-z0-9 ]+", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @classmethod
+    def _resolve_player(cls, cleaned: str) -> tuple[str, str, str]:
+        """Return (entity_id, room_key, media_text) for a music command."""
+        room_key = None
+        media = cleaned
+        m = re.search(r"\b(?:on|in|to)\s+(?:the\s+)?([a-z0-9 ]+)$", cleaned)
+        if m:
+            phrase = m.group(1).strip()
+            for key, entity in cls._MUSIC_ROOMS:  # longest keys first
+                if key in phrase:
+                    room_key = key
+                    media = (cleaned[: m.start()] + " " + cleaned[m.end():])
+                    break
+            else:
+                if phrase not in cls._GENERIC_PLACES:
+                    rooms = ", ".join(k for k, _ in cls._MUSIC_ROOMS)
+                    raise HAError(
+                        f"Unknown room '{phrase}'. Rooms: {rooms}. "
+                        "No room named means the Voice PE."
+                    )
+        if room_key is None:
+            for key, entity in cls._MUSIC_ROOMS:
+                if f" {key} " in f" {cleaned} " and key != "voice pe":
+                    room_key = key
+                    media = cleaned.replace(key, " ")
+                    break
+        if room_key is None:
+            room_key = "voice pe"
+        entity = dict(cls._MUSIC_ROOMS).get(room_key, cls._DEFAULT_PLAYER)
+        return entity, room_key, media.strip()
+
+    @staticmethod
+    def _media_parts(media: str) -> tuple[str, str]:
+        """Return (media_content_type, media_content_id) from the text."""
+        for word, ctype in (
+            ("album", "album"), ("song", "track"),
+            ("track", "track"), ("playlist", "playlist"), ("artist", "artist"),
+        ):
+            m = re.search(rf"\b(?:the\s+)?{word}\s+(.+)$", media)
+            if m:
+                return ctype, m.group(1).strip()
+        return "artist", media
+
+    def music(self, command: str) -> str:
+        """Play/stop Deezer music (via Music Assistant) on a room speaker."""
+        cleaned = self._clean_command(command)
+        if not cleaned:
+            raise HAError("Empty command.")
+
+        entity, room_key, media = self._resolve_player(cleaned)
+        states = self._get("/api/states")
+        state = next(
+            (s for s in states if s["entity_id"] == entity), None
+        )
+        if state is None or state["state"] in _BAD_STATES:
+            raise HAError(f"The {room_key} speaker is not available right now.")
+
+        if re.match(r"^(?:stop|pause)\b", media):
+            service = "media_pause" if media.startswith("pause") else "media_stop"
+            self._post(f"/api/services/media_player/{service}", {"entity_id": entity})
+            return "Paused." if service == "media_pause" else "Stopped."
+
+        media = re.sub(r"^(?:play|put on|start|queue)\s+(?:some\s+)?", "", media).strip()
+        if not media:
+            raise HAError("Name an artist, album, or track to play.")
+        media = re.sub(r"\s+music$", "", media).strip()
+        ctype, name = self._media_parts(media)
+
+        attempts = [ctype] + [t for t in ("artist", "track", "album") if t != ctype]
+        for attempt in attempts:
+            self._post(
+                "/api/services/media_player/play_media",
+                {
+                    "entity_id": entity,
+                    "media_content_id": name,
+                    "media_content_type": attempt,
+                },
+            )
+            # MA has to search Deezer and start the cast; poll briefly.
+            for _ in range(8):
+                updated = self._get(f"/api/states/{entity}")
+                attrs = updated.get("attributes", {}) if isinstance(updated, dict) else {}
+                title = attrs.get("media_title")
+                if updated.get("state") == "playing" and title:
+                    artist = attrs.get("media_artist") or ""
+                    by = f" by {artist}" if artist else ""
+                    return f"Playing {title}{by} on the {room_key}."
+                time.sleep(0.25)
+        return f"I could not start '{name}' on the {room_key}. Check the spelling or try a different search."
+
 
 def _safe_json(r: httpx.Response) -> Any:
     try:

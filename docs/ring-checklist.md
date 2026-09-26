@@ -45,6 +45,8 @@ changes before retesting.
 | "Do I own Eternal Blue by Spiritbox" | vinyl_lookup; "You own it: ..." with pressing count | ☐ |
 | "Pick a random record" | vinyl_lookup; dormancy-weighted pick | ☐ |
 | "What are my most played records" | vinyl_lookup; top plays with counts | ☐ |
+| "Play Spiritbox in the basement" | ha_music; "Playing <track> by Spiritbox on the basement." once the cast starts | ☐ |
+| "Stop the music in the basement" | ha_music; "Stopped." | ☐ |
 | Single click: "remind me to call the dentist tomorrow" | Native reminder (Pebble app), nothing in vault | ☐ |
 | Speak a secret/private thought on single click | Stays on-device; nothing hits the MCP server (check its logs) | ☐ |
 
