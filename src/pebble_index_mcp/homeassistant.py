@@ -360,27 +360,41 @@ class HAClient:
         media = re.sub(r"\s+music$", "", media).strip()
         ctype, name = self._media_parts(media)
 
+        # "the song Jaded by Spiritbox" -> try the full phrase, then the split
+        # halves, since MA's search is finicky about "by".
+        queries = [name]
+        if " by " in name:
+            title, artist = name.split(" by ", 1)
+            queries += [f"{artist} {title}", title, artist]
+
         attempts = [ctype] + [t for t in ("artist", "track", "album") if t != ctype]
         for attempt in attempts:
-            self._post(
-                "/api/services/media_player/play_media",
-                {
-                    "entity_id": entity,
-                    "media_content_id": name,
-                    "media_content_type": attempt,
-                },
-            )
-            # MA has to search Deezer and start the cast; poll briefly.
-            for _ in range(8):
-                updated = self._get(f"/api/states/{entity}")
-                attrs = updated.get("attributes", {}) if isinstance(updated, dict) else {}
-                title = attrs.get("media_title")
-                if updated.get("state") == "playing" and title:
-                    artist = attrs.get("media_artist") or ""
-                    by = f" by {artist}" if artist else ""
-                    return f"Playing {title}{by} on the {room_key}."
-                time.sleep(0.25)
-        return f"I could not start '{name}' on the {room_key}. Check the spelling or try a different search."
+            for query in queries:
+                try:
+                    self._post(
+                        "/api/services/media_player/play_media",
+                        {
+                            "entity_id": entity,
+                            "media_content_id": query,
+                            "media_content_type": attempt,
+                        },
+                    )
+                except HAError:
+                    # MA returns HTTP 500 through HA when a search resolves
+                    # to nothing (STT mangles names); that is a miss, not a
+                    # fatal error — try the next interpretation.
+                    continue
+                # MA has to search Deezer and start the cast; poll briefly.
+                for _ in range(8):
+                    updated = self._get(f"/api/states/{entity}")
+                    attrs = updated.get("attributes", {}) if isinstance(updated, dict) else {}
+                    title = attrs.get("media_title")
+                    if updated.get("state") == "playing" and title:
+                        artist = attrs.get("media_artist") or ""
+                        by = f" by {artist}" if artist else ""
+                        return f"Playing {title}{by} on the {room_key}."
+                    time.sleep(0.25)
+        return f"I could not find '{name}' on Deezer for the {room_key}. Try naming the artist or checking the wording."
 
 
 def _safe_json(r: httpx.Response) -> Any:

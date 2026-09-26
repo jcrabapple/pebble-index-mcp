@@ -198,7 +198,7 @@ def ha_control(command: str) -> CallToolResult:
     try:
         text = HA.control(command)
     except HAError as e:
-        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+        return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
 
 
@@ -213,7 +213,7 @@ def ha_announce(message: str) -> CallToolResult:
     try:
         text = HA.announce(message)
     except HAError as e:
-        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+        return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=message)
 
 
@@ -230,7 +230,7 @@ def vinyl_lookup(command: str) -> CallToolResult:
     try:
         text = VINYL.lookup(command)
     except VinylError as e:
-        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+        return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
 
 
@@ -245,7 +245,7 @@ def ha_music(command: str) -> CallToolResult:
     try:
         text = HA.music(command)
     except HAError as e:
-        return CallToolResult(content=[TextContent(type="text", text=str(e))])
+        return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
 
 

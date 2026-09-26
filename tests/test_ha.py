@@ -154,6 +154,7 @@ class FakeHA:
         self.posts = []
         self.apply = apply
         self.play_queue = []
+        self.fail_first_plays = 0
 
     def get(self, url, headers=None, timeout=None):
         if url.endswith("/api/states") or "/api/states/" in url:
@@ -175,6 +176,9 @@ class FakeHA:
             domain, svc = service
             eid = json["entity_id"]
             if svc == "play_media":
+                if self.fail_first_plays > 0:
+                    self.fail_first_plays -= 1
+                    return 500, "Media not found"
                 attrs = self.play_queue.pop(0) if self.play_queue else {}
                 for s in self.states:
                     if s["entity_id"] == eid:
@@ -366,6 +370,46 @@ def test_music_unknown_room(monkeypatch):
     with pytest.raises(HAError) as exc:
         c.music("play Spiritbox on the porch")
     assert "basement" in str(exc.value)
+
+
+def test_music_500_triggers_fallback(monkeypatch):
+    # MA returns HTTP 500 when a search resolves to nothing (STT-mangled
+    # names); the tool must try the next interpretation, not abort.
+    c = _client()
+    fake = FakeHA(_music_states())
+    fake.fail_first_plays = 1
+    fake.play_queue = [{"media_title": "Jaded", "media_artist": "Spiritbox"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play jaded")
+    types = [p[1]["media_content_type"] for p in fake.posts if p[0].endswith("play_media")]
+    assert types == ["artist", "track"]
+    assert "Jaded" in out
+
+
+def test_music_all_misses_report_honestly(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    fake.fail_first_plays = 99
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play qzxvk wjmnv")
+    assert "could not find" in out
+
+
+def test_music_by_phrase_splits_variants(monkeypatch):
+    c = _client()
+    fake = FakeHA(_music_states())
+    # First interpretation ("jaded by spiritbox") misses; the split variant
+    # ("spiritbox jaded") must be what lands.
+    fake.fail_first_plays = 1
+    fake.play_queue = [{}, {"media_title": "Jaded", "media_artist": "Spiritbox"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play the song jaded by spiritbox")
+    ids = [p[1]["media_content_id"] for p in fake.posts if p[0].endswith("play_media")]
+    assert "jaded by spiritbox" in ids and "spiritbox jaded" in ids
+    assert "Jaded" in out
 
 
 def test_control_status_never_posts(monkeypatch):
