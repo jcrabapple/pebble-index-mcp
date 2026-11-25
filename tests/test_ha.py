@@ -874,10 +874,9 @@ def test_weather_feels_like_gusts_and_hourly(monkeypatch):
         },
     )
 
-    now = datetime.datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
-    target_5pm = now.replace(hour=17)
-    if target_5pm < now:
-        target_5pm += datetime.timedelta(days=1)
+    tz = datetime.datetime.now().astimezone().tzinfo
+    t_3pm = datetime.datetime(2026, 11, 25, 15, 0, tzinfo=tz)
+    t_5pm = datetime.datetime(2026, 11, 25, 17, 0, tzinfo=tz)
 
     def fake_post(path, payload):
         if payload.get("type") == "hourly":
@@ -886,7 +885,7 @@ def test_weather_feels_like_gusts_and_hourly(monkeypatch):
                     "weather.home": {
                         "forecast": [
                             {
-                                "datetime": now.isoformat(),
+                                "datetime": t_3pm.isoformat(),
                                 "condition": "cloudy",
                                 "temperature": 41,
                                 "apparent_temperature": 34,
@@ -894,7 +893,7 @@ def test_weather_feels_like_gusts_and_hourly(monkeypatch):
                                 "precipitation": 0.0,
                             },
                             {
-                                "datetime": target_5pm.isoformat(),
+                                "datetime": t_5pm.isoformat(),
                                 "condition": "rainy",
                                 "temperature": 39,
                                 "apparent_temperature": 31,

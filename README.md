@@ -10,16 +10,16 @@ and the answer comes back as a phone notification.
 ```
 [Index ring] → [Pebble app] → [Pebble cloud agent] → [this MCP server]
                                                         ├─ respond → zero-LLM notification wrapper
-                                                        ├─ vault tools (local files, single-pass rg)
-                                                        ├─ ha_control → Home Assistant REST API
-                                                        ├─ ha_announce → assist_satellite.announce
-                                                        ├─ ha_music → Music Assistant / Deezer
+                                                        ├─ vault → search / read (head/tail) / append
+                                                        ├─ smart_home → HA control (lights/scenes/dim) + intercom
+                                                        ├─ ha_music → Music Assistant playback/transport/volume
+                                                        ├─ plex_media → Overseerr Plex search/request/status
                                                         ├─ shopping_list → HA todo.shopping_list
-                                                        ├─ weather_report → HA weather.home + sun
+                                                        ├─ weather_report → HA weather.home daily/hourly + sun
                                                         ├─ calendar_lookup → local khal CalDAV mirror
-                                                        ├─ quick_calc → math, units, ABV, tip/split, dice
+                                                        ├─ quick_calc → math, %, units, ABV, tip/split, dice
                                                         ├─ vinyl_lookup → vinyl catalog API
-                                                        └─ web_search → Exa + fast 1-round compose
+                                                        └─ web_search → Trivet metasearch (Exa fallback) + compose
 ```
 
 - The server speaks MCP over Streamable HTTP (official `mcp` SDK, FastMCP).
@@ -38,18 +38,17 @@ and the answer comes back as a phone notification.
 | `src/pebble_index_mcp/websearch.py` | `ExaClient`: live web search against the Exa API, snippets truncated locally. Errors map to `ExaError`; a missing key short-circuits with a clear message. |
 | `src/pebble_index_mcp/homeassistant.py` | `HAClient`: deterministic smart-home commands against the Home Assistant REST API. Parses the action from the command text, resolves the target entity by token match (preferring room group entities over individual fixtures and available over unavailable entities), calls the service, then polls the state readback to confirm. No LLM in the loop. Also `announce()`: intercom messages to every live `assist_satellite` (offline satellites are pre-filtered because HA returns 200 for announce regardless). |
 | `src/pebble_index_mcp/vinyl.py` | `VinylClient`: lookups against the operator's self-hosted vinyl catalog API. Routes command text to a random pick, most-played list, or artist/album search; conversational filler is stripped before the catalog's full-text query. Base URL is operator config only. |
+| `src/pebble_index_mcp/overseerr.py` | `OverseerrClient`: checks Plex availability, submits movie/TV requests (with per-season duplicate protection and `%20` query encoding), and lists recent requests with resolved titles. |
 | `src/pebble_index_mcp/calendar.py` | `CalendarClient`: queries the local `khal` Fastmail CalDAV mirror (with `RRULE` recurrence expansion) for today/tomorrow/weekday/7-day schedules and event keyword searches. |
 | `src/pebble_index_mcp/calc.py` | Deterministic AST arithmetic, unit conversions (temp, volume, mass, length), mead gravity ABV, tip/bill splits, coin flips, and dice rolls. |
 | `src/pebble_index_mcp/server.py` | FastMCP app: registers the tools and the `ring_persona` prompt, wraps the streamable-http app in bearer auth (constant-time compare) and configures host allow-listing. |
 
 ## Tools
 
-- `respond(answer)` — zero-LLM notification wrapper: the Repebble cloud agent passes its 1–3 sentence plain-text answer directly so the phone notification displays it without a second LLM round-trip. Used for general knowledge and after `vault_search` / `vault_read`.
-- `vault_search(query, max_results=5)` — filename/path + fixed-string + multi-term search over the vault; returns `path: excerpt` lines.
-- `vault_read(note_path, max_chars=1500, tail=False)` — reads the head (or tail when `tail=True`, for append-only logs) of a note; resolves missing `.md` extensions case-insensitively.
-- `vault_append(note_path, text)` — appends a dated `- YYYY-MM-DD HH:MM text` line, creating the note if needed, wrapped in `coreSchema` `Response` for one-shot confirmation.
-- `ha_control(command)` — smart-home commands: `"living room lights on"`, `"dim living room to 30%"`, `"set basement to relax"`, `"bedroom nightlight scene"`, `"all lights off"`, `"toggle the hallway"`, `"open the blinds"`, `"is the living room tv on"`. Resolves lights, switches, fans, covers, media players, and Hue scenes (`scene.*`), prefers room groups over individual fixtures, and reports brightness on light status queries. Requires `HASS_TOKEN`.
-- `ha_announce(message)` — intercom: speaks `message` on every live `assist_satellite` device with a pre-announce chime. Offline satellites are skipped (HA returns 200 for announce even when the device is down, so the tool pre-filters). Requires `HASS_TOKEN`.
+- `respond(answer)` — zero-LLM notification wrapper: the Repebble cloud agent passes its 1–3 sentence plain-text answer directly so the phone notification displays it without a second LLM round-trip. Used for general knowledge and after `vault` search/read.
+- `vault(action, query="", note_path="", text="", max_results=5, max_chars=1500, tail=False)` — consolidated Obsidian vault tool: `search` (filename + fixed-string + multi-term), `read` (head or `tail=True` for logs, with case-insensitive `.md` resolution), and `append` (dated `- YYYY-MM-DD HH:MM text` line wrapped in `coreSchema` `Response`).
+- `smart_home(action, command)` — consolidated Home Assistant control & intercom tool: `control` (`"living room lights on"`, `"dim living room to 30%"`, `"set basement to relax"`, `"all lights off"`, `"open the blinds"`, `"is the hallway light on"`) and `announce` (intercom on live `assist_satellite` devices). Requires `HASS_TOKEN`.
+- `plex_media(action, query="", media_type="", season=None)` — Overseerr / Plex media requests: `request` (`"Sinners"`, `media_type="movie"`; `"Severance"`, `season=2`), `status` (`"is Dune 2 on Plex"`), and `requests` (recent request statuses with resolved titles). Never re-requests items already available or downloading. Requires `OVERSEERR_URL` and `OVERSEERR_API_KEY`.
 - `ha_music(command)` — music control: playback (`"play Spiritbox in the basement"`), transport (`"pause"`, `"resume"`, `"skip"`, `"previous"`, `"stop"`), volume (`"volume 40 in the kitchen"`, `"turn it down"`, `"mute basement"`), and status (`"what's playing"`). Discovers Music Assistant players (`media_player.*_2`) dynamically from HA states (with optional `HASS_MUSIC_ROOMS` aliases and `HASS_DEFAULT_PLAYER` fallback chain), targets the actively playing speaker for roomless transport commands, and verifies playback within a bounded timeout. Requires `HASS_TOKEN` and Music Assistant.
 - `shopping_list(command)` — reads, adds to (including multi-item adds and `"we need ..."` phrasing), or safely checks off items on Home Assistant's `todo.shopping_list`. Requires `HASS_TOKEN`.
 - `weather_report(query)` — local current weather (including feels-like temperature when notable), daily and hourly forecasts (`"will it rain tonight"`, `"weather at 5pm"`), wind gusts, and sunrise/sunset times from Home Assistant (`weather.home` + `sensor.sun_next_*`), avoiding external web search latency. Requires `HASS_TOKEN`.
@@ -99,6 +98,7 @@ Every user-facing tool wraps its result in the Pebble app's private `coreSchema`
 | `KHAL_BIN` | auto | Optional explicit path to the `khal` binary for `calendar_lookup` |
 | `ENABLE_ASK_HERMES` | `0` | Set to `1` to register the legacy `ask_hermes` tool (leave off to use `respond`) |
 | `VINYL_URL` | — | Base URL of a vinyl catalog API exposing `GET /api/records?q=`, `GET /api/random`, `GET /api/plays/top` for `vinyl_lookup`; without it the tool reports an error but the rest of the server works |
+| `OVERSEERR_URL` / `OVERSEERR_API_KEY` | — | Overseerr base URL and API key for `plex_media` (Plex availability checks and download requests) |
 | `RING_PERSONA_FILE` | — | Optional path to a text file replacing the generic cloud-agent persona |
 
 `HERMES_API_URL` accepts any OpenAI-compatible chat completions endpoint, so

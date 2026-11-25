@@ -30,24 +30,29 @@ changes before retesting.
 
 | Say (double-click) | Expected | Result |
 |---|---|---|
-| "Search my notes for mead cyser" | `vault_search` -> `respond`: notification listing `Mead/...` note | ☐ |
-| "Add racked the cyser to mead log" | `vault_append`: dated `- YYYY-MM-DD HH:MM ...` line in `Mead Log.md` | ☐ |
+| "Search my notes for mead cyser" | `vault(search)` -> `respond`: notification listing `Mead/...` note | ☐ |
+| "Add racked the cyser to mead log" | `vault(append)`: dated `- YYYY-MM-DD HH:MM ...` line in `Mead Log.md` | ☐ |
 | "What is 14 times 12" | `quick_calc`: `"168."` in ~1s | ☐ |
 | "20% off $80" | `quick_calc`: `"20% off $80.00 is $64.00 (save $16.00)."` | ☐ |
 | "ABV 1.105 to 1.000" | `quick_calc`: `"1.105 to 1.000 is 13.8% ABV."` | ☐ |
 | "What is the capital of Montana" | `respond`: `"Helena."` (zero extra LLM hop) | ☐ |
 | "Search the web for the next SpaceX launch" | `web_search`: spoken answer (not the question) with current info | ☐ |
-| "What's the weather today" | `weather_report`: local HA current + forecast | ☐ |
+| "What's the weather today" | `weather_report`: local HA current + feels-like + forecast + gusts | ☐ |
+| "Will it rain tonight" | `weather_report`: hourly forecast | ☐ |
 | "When is sunset" | `weather_report`: local HA sunrise/sunset | ☐ |
 | "What's on my calendar tomorrow" | `calendar_lookup`: 12-hour formatted schedule | ☐ |
 | "Add oat milk and eggs to the shopping list" | `shopping_list`: adds both items | ☐ |
 | "Check off milk from the shopping list" | `shopping_list`: removes Milk safely | ☐ |
-| "Turn on the living room lights" | `ha_control`: `"Living Room is now on."` in ~2-5s | ☐ |
-| "Turn off the living room lights" | `ha_control`: `"Living Room is now off."` | ☐ |
-| "Is the hallway light on" | `ha_control` status: `"Hallway: on."` | ☐ |
-| "Lights on" (no room) | `ha_control` asks which room (ambiguity candidates) | ☐ |
-| "Turn on the garage lights" | `ha_control`: `"No device matches"` (honest miss) | ☐ |
-| "Tell the house dinner is ready" | `ha_announce`: pre-announce chime then message on live Voice PE | ☐ |
+| "Turn on the living room lights" | `smart_home(control)`: `"Living Room is now on."` in ~2-5s | ☐ |
+| "Dim the living room to 30%" | `smart_home(control)`: `"Living Room set to 30%."` | ☐ |
+| "Set basement to relax" | `smart_home(control)`: `"Activated Basement Relax."` | ☐ |
+| "Is the hallway light on" | `smart_home(control)`: `"Hallway: on."` | ☐ |
+| "Lights on" (no room) | `smart_home(control)` asks which room (ambiguity candidates) | ☐ |
+| "Turn on the garage lights" | `smart_home(control)`: `"No device matches"` (honest miss) | ☐ |
+| "Tell the house dinner is ready" | `smart_home(announce)`: pre-announce chime then message on live Voice PE | ☐ |
+| "Is Severance on Plex" | `plex_media(status)`: `"Severance (2022, TV): available on Plex."` | ☐ |
+| "Download the movie Sinners to Plex" | `plex_media(request)`: submits Overseerr request or reports already on Plex | ☐ |
+| "What's downloading on Plex" | `plex_media(requests)`: lists recent Overseerr requests with titles | ☐ |
 | "Do I own Eternal Blue by Spiritbox" | `vinyl_lookup`: `"You own it: ..."` with pressing count | ☐ |
 | "Pick a random record" | `vinyl_lookup`: dormancy-weighted pick | ☐ |
 | "What are my most played records" | `vinyl_lookup`: top plays with counts | ☐ |

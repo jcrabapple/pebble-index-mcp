@@ -151,7 +151,8 @@ def test_vault_tool_without_vault_path(monkeypatch):
     monkeypatch.delenv("VAULT_PATH", raising=False)
     monkeypatch.setenv("MCP_BEARER_TOKEN", "sekret")
     importlib.reload(srv)
-    assert "VAULT_PATH is not configured" in srv.vault_search("anything")
+    r = srv.vault("search", query="anything")
+    assert "VAULT_PATH is not configured" in r.content[0].text
 
 
 def _reload(monkeypatch, **env):
@@ -163,6 +164,8 @@ def _reload(monkeypatch, **env):
         "TRIVET_URL",
         "TRIVET_USER",
         "TRIVET_PASS",
+        "OVERSEERR_URL",
+        "OVERSEERR_API_KEY",
     ):
         monkeypatch.delenv(clear_key, raising=False)
     monkeypatch.setenv("MCP_BEARER_TOKEN", "sekret")
@@ -272,14 +275,14 @@ def test_hermes_task_without_agent_configuration(monkeypatch):
     assert "not configured" in r.structuredContent["semanticResult"]["text"]
 
 
-def test_ha_announce_error_returns_original_message(monkeypatch):
+def test_smart_home_announce_error_returns_original_message(monkeypatch):
     srv = _reload(monkeypatch, VAULT_PATH="")
 
     def fail(message):
         raise srv.HAError("No available speaker")
 
     monkeypatch.setattr(srv.HA, "announce", fail)
-    r = srv.ha_announce("dinner is ready")
+    r = srv.smart_home("announce", "dinner is ready")
     assert r.structuredContent["semanticResult"] == {
         "type": "Response",
         "text": "No available speaker",
@@ -297,12 +300,37 @@ def test_respond_returns_core_schema_without_llm(monkeypatch):
     }
 
 
-def test_vault_append_returns_core_schema_response(monkeypatch, tmp_path):
+def test_vault_consolidated_actions(monkeypatch, tmp_path):
     srv = _reload(monkeypatch, VAULT_PATH=str(tmp_path))
-    r = srv.vault_append("Inbox.md", "buy yeast")
-    assert r.meta == {"coreSchema": 1}
-    assert r.structuredContent["semanticResult"]["text"] == "Appended to Inbox.md"
+    r_app = srv.vault("append", note_path="Inbox.md", text="buy yeast")
+    assert r_app.meta == {"coreSchema": 1}
+    assert r_app.structuredContent["semanticResult"]["text"] == "Appended to Inbox.md"
     assert (tmp_path / "Inbox.md").is_file()
+
+    r_search = srv.vault("search", query="yeast")
+    assert r_search.meta is None
+    assert "Inbox.md" in r_search.content[0].text
+
+    r_read = srv.vault("read", note_path="Inbox.md", tail=True)
+    assert r_read.meta is None
+    assert "buy yeast" in r_read.content[0].text
+
+
+def test_plex_media_tool_actions(monkeypatch):
+    srv = _reload(monkeypatch, VAULT_PATH="", OVERSEERR_URL="https://o.test", OVERSEERR_API_KEY="k")
+    monkeypatch.setattr(srv.OVERSEERR, "request_media", lambda q, media_type="", season=None: f"Requested {q}.")
+    monkeypatch.setattr(srv.OVERSEERR, "status", lambda q, media_type="": f"{q}: available on Plex.")
+    monkeypatch.setattr(srv.OVERSEERR, "recent_requests", lambda: "Recent Plex requests: Severance (available on Plex).")
+
+    r_req = srv.plex_media("request", query="Sinners", media_type="movie")
+    assert r_req.meta == {"coreSchema": 1}
+    assert r_req.structuredContent["semanticResult"]["text"] == "Requested Sinners."
+
+    r_st = srv.plex_media("status", query="Severance")
+    assert r_st.structuredContent["semanticResult"]["text"] == "Severance: available on Plex."
+
+    r_list = srv.plex_media("requests")
+    assert "Severance" in r_list.structuredContent["semanticResult"]["text"]
 
 
 def test_new_deterministic_tools_wrap_spoken_response(monkeypatch):

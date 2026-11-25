@@ -22,6 +22,7 @@ from .calc import CalcError, evaluate as eval_calc
 from .calendar import CalendarClient, CalendarError
 from .hermes import HermesClient, HermesError, HermesTimeout
 from .homeassistant import HAClient, HAError, parse_music_rooms_env
+from .overseerr import OverseerrClient, OverseerrError
 from .vault import Vault, VaultAccessError
 from .vinyl import VinylClient, VinylError
 from .websearch import ExaClient, ExaError, TrivetClient, TrivetError
@@ -82,6 +83,12 @@ if not HA.token:
 VINYL = VinylClient(url=os.environ.get("VINYL_URL", "").strip())
 if not VINYL.url:
     logger.warning("VINYL_URL is not set; vinyl_lookup will report an error")
+OVERSEERR = OverseerrClient(
+    url=os.environ.get("OVERSEERR_URL", "").strip(),
+    api_key=os.environ.get("OVERSEERR_API_KEY", "").strip(),
+)
+if not OVERSEERR.url or not OVERSEERR.api_key:
+    logger.warning("OVERSEERR_URL/OVERSEERR_API_KEY not set; plex_media will report an error")
 CALENDAR = CalendarClient(khal_bin=os.environ.get("KHAL_BIN", "").strip())
 
 # DNS-rebinding protection: allow loopback plus any hosts named in
@@ -109,53 +116,55 @@ def _vault_or_error() -> Vault:
 
 
 @mcp.tool()
-def vault_search(query: str, max_results: int = 5) -> str:
-    """Search the user's Obsidian vault by filename and content (case-insensitive).
+def vault(
+    action: str,
+    query: str = "",
+    note_path: str = "",
+    text: str = "",
+    max_results: int = 5,
+    max_chars: int = 1500,
+    tail: bool = False,
+) -> CallToolResult:
+    """Search, read, or append to notes in the user's Obsidian vault.
 
-    Use when the user asks where something is or whether a note exists.
-    Returns "relative/path.md: excerpt" lines. Facts about the vault must
-    come from this tool or vault_read; never invent them.
+    action:
+    - "search": search filenames and note contents using query (returns
+      "relative/path.md: excerpt" lines; call respond(answer) afterward).
+    - "read": read note_path (relative to vault root, e.g. "Writing/ideas.md").
+      Set tail=True for append-only logs like Inbox.md. Call respond(answer)
+      afterward with your summary.
+    - "append": append a dated "- YYYY-MM-DD HH:MM text" line to note_path
+      (default "Inbox.md"), creating it if needed. Never overwrites.
     """
     started = time.perf_counter()
-    try:
-        out = _vault_or_error().search(query, max_results)
-        _log_tool("vault_search", started, ok=True)
-        return out
-    except VaultAccessError as e:
-        _log_tool("vault_search", started, ok=False, detail=str(e))
-        return str(e)
-
-
-@mcp.tool()
-def vault_read(note_path: str, max_chars: int = 1500, tail: bool = False) -> str:
-    """Read a note from the Obsidian vault. note_path is relative to the vault
-    root, e.g. "Writing/ideas.md". Set tail=True for append-only logs like
-    Inbox.md to read the most recent entries."""
-    started = time.perf_counter()
-    try:
-        out = _vault_or_error().read(note_path, max_chars, tail=tail)
-        _log_tool("vault_read", started, ok=True)
-        return out
-    except VaultAccessError as e:
-        _log_tool("vault_read", started, ok=False, detail=str(e))
-        return str(e)
-
-
-@mcp.tool()
-def vault_append(note_path: str, text: str) -> CallToolResult:
-    """Append a line to a note in the Obsidian vault, creating it if needed.
-
-    Use only when the user explicitly asks to save or add something to a
-    note. Appends a timestamped "- YYYY-MM-DD HH:MM text" line. Never
-    overwrites or deletes."""
-    started = time.perf_counter()
-    try:
-        out = _vault_or_error().append(note_path, text)
-        _log_tool("vault_append", started, ok=True)
-    except VaultAccessError as e:
-        out = f"Could not append: {e}"
-        _log_tool("vault_append", started, ok=False, detail=str(e))
-    return _spoken_response(out, question=f"Append to {note_path}")
+    act = (action or "").strip().lower()
+    if act == "search":
+        try:
+            out = _vault_or_error().search(query, max_results)
+            _log_tool("vault:search", started, ok=True)
+        except VaultAccessError as e:
+            out = str(e)
+            _log_tool("vault:search", started, ok=False, detail=str(e))
+        return CallToolResult(content=[TextContent(type="text", text=out)])
+    if act == "read":
+        try:
+            out = _vault_or_error().read(note_path, max_chars, tail=tail)
+            _log_tool("vault:read", started, ok=True)
+        except VaultAccessError as e:
+            out = str(e)
+            _log_tool("vault:read", started, ok=False, detail=str(e))
+        return CallToolResult(content=[TextContent(type="text", text=out)])
+    if act == "append":
+        target = note_path.strip() or "Inbox.md"
+        try:
+            out = _vault_or_error().append(target, text)
+            _log_tool("vault:append", started, ok=True)
+        except VaultAccessError as e:
+            out = f"Could not append: {e}"
+            _log_tool("vault:append", started, ok=False, detail=str(e))
+        return _spoken_response(out, question=f"Append to {target}")
+    _log_tool("vault", started, ok=False, detail=f"unknown action {act}")
+    return _spoken_response('Unknown vault action; use "search", "read", or "append".')
 
 
 @mcp.tool()
@@ -163,10 +172,10 @@ def respond(answer: str) -> CallToolResult:
     """Deliver the final spoken answer to the user's phone notification.
 
     ALWAYS call this tool as your final action when answering general
-    knowledge questions or summarizing results from vault_search or
-    vault_read. Without it, the phone notification shows the user's
-    question instead of your answer. Keep answer to at most 3 short
-    sentences, plain text, no markdown."""
+    knowledge questions or summarizing results from vault search/read.
+    Without it, the phone notification shows the user's question instead
+    of your answer. Keep answer to at most 3 short sentences, plain text,
+    no markdown."""
     started = time.perf_counter()
     cleaned = answer.strip() or "No answer provided."
     _log_tool("respond", started, ok=True)
@@ -301,40 +310,70 @@ if HERMES_AGENT is not None:
 
 
 @mcp.tool()
-def ha_control(command: str) -> CallToolResult:
-    """Control the user's smart home: lights, Hue scenes, dimming, switches, fans, covers, and TVs.
+def smart_home(action: str, command: str) -> CallToolResult:
+    """Control Home Assistant devices/scenes or make a house intercom announcement.
 
-    ALWAYS use this for smart-home commands like "living room lights on",
-    "dim living room to 30%", "set basement to relax", "bedroom nightlight
-    scene", "all lights off", "toggle the hallway", "open the blinds", or
-    "is the living room tv on". command is the spoken request in plain text.
-    Verifies state changes and returns the new state."""
+    action:
+    - "control": lights, Hue scenes, dimming, all lights off/on, switches,
+      fans, covers, TVs. Pass the spoken command (e.g. "living room lights
+      on", "dim living room to 30%", "set basement to relax", "all lights
+      off", "is the hallway light on").
+    - "announce": intercom announcement on live house speaker(s). Pass ONLY
+      the words to speak (e.g. "dinner is ready").
+    """
     started = time.perf_counter()
+    act = (action or "").strip().lower()
     try:
-        text = HA.control(command)
-        _log_tool("ha_control", started, ok=True)
+        if act == "announce":
+            text = HA.announce(command)
+            _log_tool("smart_home:announce", started, ok=True)
+        elif act in ("control", ""):
+            text = HA.control(command)
+            _log_tool("smart_home:control", started, ok=True)
+        else:
+            _log_tool("smart_home", started, ok=False, detail=f"unknown action {act}")
+            return _spoken_response('Unknown smart_home action; use "control" or "announce".')
     except HAError as e:
-        _log_tool("ha_control", started, ok=False, detail=str(e))
+        _log_tool(f"smart_home:{act or 'control'}", started, ok=False, detail=str(e))
         return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
 
 
 @mcp.tool()
-def ha_announce(message: str) -> CallToolResult:
-    """Make a spoken announcement on the house speaker(s), like an intercom.
+def plex_media(
+    action: str,
+    query: str = "",
+    media_type: str = "",
+    season: int | None = None,
+) -> CallToolResult:
+    """Check Plex availability, request movies/TV shows for Plex, or list recent requests via Overseerr.
 
-    Use when the user says "tell everyone ...", "announce ...", or "tell the
-    house ...". message is ONLY the words to speak, with the routing phrase
-    stripped (for "tell the house dinner is ready", message is "dinner is
-    ready"). Keep it short. Returns the number of speakers it played on."""
+    action:
+    - "request": download/request a movie or TV show to Plex (e.g. query="Sinners",
+      media_type="movie"; or query="Severance", media_type="tv", season=2).
+      Never re-downloads items already on Plex.
+    - "status": check whether a movie or TV show is already on Plex or downloading.
+    - "requests": list recent Plex media requests and their status.
+    """
     started = time.perf_counter()
+    act = (action or "").strip().lower()
     try:
-        text = HA.announce(message)
-        _log_tool("ha_announce", started, ok=True)
-    except HAError as e:
-        _log_tool("ha_announce", started, ok=False, detail=str(e))
-        return _spoken_response(str(e), question=message)
-    return _spoken_response(text, question=message)
+        if act in ("request", "download", "add"):
+            text = OVERSEERR.request_media(query, media_type=media_type, season=season)
+            _log_tool("plex_media:request", started, ok=True)
+        elif act in ("status", "search", "check"):
+            text = OVERSEERR.status(query, media_type=media_type)
+            _log_tool("plex_media:status", started, ok=True)
+        elif act in ("requests", "list", "recent"):
+            text = OVERSEERR.recent_requests()
+            _log_tool("plex_media:requests", started, ok=True)
+        else:
+            _log_tool("plex_media", started, ok=False, detail=f"unknown action {act}")
+            return _spoken_response('Unknown plex_media action; use "request", "status", or "requests".')
+    except OverseerrError as e:
+        _log_tool(f"plex_media:{act}", started, ok=False, detail=str(e))
+        return _spoken_response(str(e), question=query or act)
+    return _spoken_response(text, question=query or act)
 
 
 @mcp.tool()
@@ -453,20 +492,24 @@ _GENERIC_PERSONA = (
     "Rules:\n"
     "- Answer in at most 3 short sentences. No markdown. The answer is "
     "shown as a phone notification.\n"
-    "- Facts about the vault must come from vault_search or vault_read. "
-    "Never invent note contents or file names. After reading or searching "
+    "- Facts about the vault must come from vault(action='search' or 'read'). "
+    "Never invent note contents or file names. After searching or reading "
     "the vault, call respond(answer) with your summary so it appears in the "
     "phone notification.\n"
-    "- When asked to save a note, use vault_append; if the target note "
-    "is unclear, use Inbox.md.\n"
-    "- For smart-home commands (lights, switches, fans, covers, TVs), "
-    "ALWAYS use ha_control.\n"
-    "- For house intercom/announcement requests, ALWAYS use ha_announce "
-    "with only the words to speak.\n"
-    "- For music playback/stop requests on house speakers, ALWAYS use ha_music.\n"
+    "- When asked to save a note, use vault(action='append'); if the target "
+    "note is unclear, use Inbox.md.\n"
+    "- For smart-home commands (lights, dimming, Hue scenes, all lights off, "
+    "switches, fans, covers, TVs), ALWAYS use smart_home(action='control').\n"
+    "- For house intercom/announcement requests, ALWAYS use "
+    "smart_home(action='announce') with only the words to speak.\n"
+    "- For music playback, transport, volume, or now-playing queries on house "
+    "speakers, ALWAYS use ha_music.\n"
+    "- For movies or TV shows on Plex (downloading/requesting via Overseerr, "
+    "checking if something is on Plex, or listing recent requests), ALWAYS "
+    "use plex_media.\n"
     "- For shopping/grocery list items, ALWAYS use shopping_list.\n"
-    "- For local weather, forecast, rain, sunrise, or sunset, ALWAYS use "
-    "weather_report instead of web_search.\n"
+    "- For local weather, hourly/daily forecast, rain, gusts, sunrise, or "
+    "sunset, ALWAYS use weather_report instead of web_search.\n"
     "- For schedule, calendar, appointments, or when an event is, ALWAYS "
     "use calendar_lookup.\n"
     "- For math, percentages, discounts, unit conversions, tips, bill "
