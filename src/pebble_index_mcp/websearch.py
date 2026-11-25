@@ -15,6 +15,7 @@ class ExaClient:
     def __init__(self, api_key: str, url: str = "https://api.exa.ai/search"):
         self.api_key = api_key
         self.url = url
+        self._client = httpx.Client(timeout=_TIMEOUT)
 
     def search(self, query: str, num_results: int = 3) -> str:
         """Query the Exa search API and return title/url/snippet lines."""
@@ -26,7 +27,7 @@ class ExaClient:
             "contents": {"text": {"maxCharacters": _SNIPPET_CHARS}},
         }
         try:
-            r = httpx.post(
+            r = self._client.post(
                 url=self.url,
                 json=payload,
                 headers={"x-api-key": self.api_key},

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import time
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -17,13 +18,27 @@ from mcp.types import (
 from mcp.types import Prompt as MCPPrompt
 from starlette.responses import JSONResponse
 
+from .calc import CalcError, evaluate as eval_calc
+from .calendar import CalendarClient, CalendarError
 from .hermes import HermesClient, HermesError, HermesTimeout
-from .homeassistant import HAClient, HAError
+from .homeassistant import HAClient, HAError, parse_music_rooms_env
 from .vault import Vault, VaultAccessError
 from .vinyl import VinylClient, VinylError
 from .websearch import ExaClient, ExaError
 
 logger = logging.getLogger("pebble_index_mcp")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+def _log_tool(name: str, started: float, *, ok: bool = True, detail: str = "") -> None:
+    ms = int((time.perf_counter() - started) * 1000)
+    suffix = f" ({detail[:80]})" if detail else ""
+    logger.info("tool=%s ok=%s ms=%d%s", name, ok, ms, suffix)
 
 _VAULT_PATH = os.environ.get("VAULT_PATH", "").strip()
 if _VAULT_PATH:
@@ -36,19 +51,33 @@ HERMES = HermesClient(
     url=os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642/v1/chat/completions"),
     api_key=os.environ.get("HERMES_API_KEY", ""),
     model=os.environ.get("RING_MODEL", "pebble-ring"),
+    provider_order=os.environ.get("RING_PROVIDER_ORDER", ""),
 )
 EXA = ExaClient(api_key=os.environ.get("EXA_API_KEY", ""))
+HERMES_AGENT = None
+if os.environ.get("HERMES_AGENT_API_URL", "").strip():
+    HERMES_AGENT = HermesClient(
+        url=os.environ["HERMES_AGENT_API_URL"],
+        api_key=os.environ.get("HERMES_AGENT_API_KEY", ""),
+        model=os.environ.get("HERMES_AGENT_MODEL", "pebble-ring"),
+        timeout=float(os.environ.get("HERMES_AGENT_TIMEOUT", "120")),
+        api_provider=os.environ.get("HERMES_AGENT_PROVIDER", ""),
+        reasoning_effort=os.environ.get("HERMES_AGENT_REASONING_EFFORT", ""),
+    )
 if not EXA.api_key:
     logger.warning("EXA_API_KEY is not set; web_search will report an error")
 HA = HAClient(
     url=os.environ.get("HASS_URL", "http://127.0.0.1:8123"),
     token=os.environ.get("HASS_TOKEN", ""),
+    music_rooms=parse_music_rooms_env(os.environ.get("HASS_MUSIC_ROOMS", "")),
+    default_players=os.environ.get("HASS_DEFAULT_PLAYER", ""),
 )
 if not HA.token:
     logger.warning("HASS_TOKEN is not set; ha_control will report an error")
 VINYL = VinylClient(url=os.environ.get("VINYL_URL", "").strip())
 if not VINYL.url:
     logger.warning("VINYL_URL is not set; vinyl_lookup will report an error")
+CALENDAR = CalendarClient(khal_bin=os.environ.get("KHAL_BIN", "").strip())
 
 # DNS-rebinding protection: allow loopback plus any hosts named in
 # MCP_ALLOWED_HOSTS (comma-separated). The public tunnel hostname goes there.
@@ -76,38 +105,67 @@ def _vault_or_error() -> Vault:
 
 @mcp.tool()
 def vault_search(query: str, max_results: int = 5) -> str:
-    """Search the user's Obsidian vault (case-insensitive text search).
+    """Search the user's Obsidian vault by filename and content (case-insensitive).
 
     Use when the user asks where something is or whether a note exists.
     Returns "relative/path.md: excerpt" lines. Facts about the vault must
     come from this tool or vault_read; never invent them.
     """
+    started = time.perf_counter()
     try:
-        return _vault_or_error().search(query, max_results)
+        out = _vault_or_error().search(query, max_results)
+        _log_tool("vault_search", started, ok=True)
+        return out
     except VaultAccessError as e:
+        _log_tool("vault_search", started, ok=False, detail=str(e))
         return str(e)
 
 
 @mcp.tool()
-def vault_read(note_path: str, max_chars: int = 1500) -> str:
+def vault_read(note_path: str, max_chars: int = 1500, tail: bool = False) -> str:
     """Read a note from the Obsidian vault. note_path is relative to the vault
-    root, e.g. "Writing/ideas.md". Returns the first max_chars characters."""
+    root, e.g. "Writing/ideas.md". Set tail=True for append-only logs like
+    Inbox.md to read the most recent entries."""
+    started = time.perf_counter()
     try:
-        return _vault_or_error().read(note_path, max_chars)
+        out = _vault_or_error().read(note_path, max_chars, tail=tail)
+        _log_tool("vault_read", started, ok=True)
+        return out
     except VaultAccessError as e:
+        _log_tool("vault_read", started, ok=False, detail=str(e))
         return str(e)
 
 
 @mcp.tool()
-def vault_append(note_path: str, text: str) -> str:
+def vault_append(note_path: str, text: str) -> CallToolResult:
     """Append a line to a note in the Obsidian vault, creating it if needed.
 
-    Use only when the user explicitly asks to save or add something. Appends
-    a timestamped "- HH:MM text" line. Never overwrites or deletes."""
+    Use only when the user explicitly asks to save or add something to a
+    note. Appends a timestamped "- YYYY-MM-DD HH:MM text" line. Never
+    overwrites or deletes."""
+    started = time.perf_counter()
     try:
-        return _vault_or_error().append(note_path, text)
+        out = _vault_or_error().append(note_path, text)
+        _log_tool("vault_append", started, ok=True)
     except VaultAccessError as e:
-        return f"Could not append: {e}"
+        out = f"Could not append: {e}"
+        _log_tool("vault_append", started, ok=False, detail=str(e))
+    return _spoken_response(out, question=f"Append to {note_path}")
+
+
+@mcp.tool()
+def respond(answer: str) -> CallToolResult:
+    """Deliver the final spoken answer to the user's phone notification.
+
+    ALWAYS call this tool as your final action when answering general
+    knowledge questions or summarizing results from vault_search or
+    vault_read. Without it, the phone notification shows the user's
+    question instead of your answer. Keep answer to at most 3 short
+    sentences, plain text, no markdown."""
+    started = time.perf_counter()
+    cleaned = answer.strip() or "No answer provided."
+    _log_tool("respond", started, ok=True)
+    return _spoken_response(cleaned)
 
 
 def _spoken_response(text: str, question: str | None = None) -> CallToolResult:
@@ -139,18 +197,28 @@ def web_search(query: str, max_results: int = 3) -> CallToolResult:
     live search results, plus the raw results for reference. For questions
     about the user's notes, prefer vault_search instead.
     """
+    started = time.perf_counter()
     try:
         results = EXA.search(query, max_results)
     except ExaError as e:
+        logger.info("web_search search failed after %.3fs", time.perf_counter() - started)
         return CallToolResult(
             content=[TextContent(type="text", text=f"Web search unavailable ({e})")]
         )
+    search_done = time.perf_counter()
     try:
         answer = HERMES.compose_answer(query, results)
     except (HermesTimeout, HermesError):
         # Compose is best-effort; fall back to raw results so the cloud
         # agent can still answer in the feed (notification shows the question).
         answer = None
+    compose_done = time.perf_counter()
+    logger.info(
+        "web_search timing search=%.3fs compose=%.3fs total=%.3fs",
+        search_done - started,
+        compose_done - search_done,
+        compose_done - started,
+    )
     if not answer:
         return CallToolResult(content=[TextContent(type="text", text=results)])
     spoken = answer
@@ -166,38 +234,68 @@ def web_search(query: str, max_results: int = 3) -> CallToolResult:
     return result
 
 
-@mcp.tool()
 def ask_hermes(question: str) -> CallToolResult:
-    """Forward a question or task to the user's AI agent (Hermes).
+    """Answer a general question with the configured chat model.
 
-    Use for questions the vault tools cannot answer: lookups, research, or
-    tasks. Returns the agent's final answer (kept short by instruction)."""
+    Deprecated in favor of `respond(answer)` (which avoids a second LLM hop).
+    Registered as an MCP tool only when ENABLE_ASK_HERMES=1."""
+    started = time.perf_counter()
     try:
         answer = HERMES.ask(question)
     except HermesTimeout:
-        answer = (
-            "Hermes is still working on it. It will finish shortly; "
-            "re-ask or check Telegram."
-        )
+        answer = "The answer service timed out. Please try again."
     except HermesError as e:
         return CallToolResult(
             content=[TextContent(type="text", text=f"Hermes unavailable ({e})")]
         )
+    logger.info("ask_hermes timing total=%.3fs", time.perf_counter() - started)
     return _spoken_response(answer, question=question)
+
+
+if os.environ.get("ENABLE_ASK_HERMES", "").strip() in ("1", "true", "yes"):
+    mcp.tool()(ask_hermes)
+
+
+def hermes_task(task: str) -> CallToolResult:
+    """Run a task with the user's full Hermes agent, including its tools.
+
+    Use when the user explicitly says "ask Hermes" or "tell Hermes", or when
+    the request needs Hermes agent capabilities beyond the dedicated tools.
+    This is slower than direct tools. task is the complete spoken request."""
+    if HERMES_AGENT is None:
+        return _spoken_response("The full Hermes agent is not configured.", question=task)
+    started = time.perf_counter()
+    try:
+        answer = HERMES_AGENT.ask(task)
+        _log_tool("hermes_task", started, ok=True)
+    except HermesTimeout:
+        answer = "Hermes timed out. Please try again or check Matrix."
+        _log_tool("hermes_task", started, ok=False, detail="timeout")
+    except HermesError as e:
+        answer = f"Hermes unavailable ({e})"
+        _log_tool("hermes_task", started, ok=False, detail=str(e))
+    return _spoken_response(answer, question=task)
+
+
+if HERMES_AGENT is not None:
+    mcp.tool()(hermes_task)
 
 
 @mcp.tool()
 def ha_control(command: str) -> CallToolResult:
-    """Control the user's smart home: lights, switches, fans, and media players.
+    """Control the user's smart home: lights, switches, fans, covers, and media players.
 
     ALWAYS use this for smart-home commands like "living room lights on",
-    "bedroom off", "toggle the hallway", or "is the living room tv on",
-    instead of ask_hermes. command is the spoken request in plain text.
-    Supported actions: on, off, toggle, status. Verifies the change and
-    returns the device's new state."""
+    "bedroom off", "toggle the hallway", "open the blinds", or "is the
+    living room tv on". command is the spoken request in plain text.
+    Supported actions: on, off, open, close, toggle, status. Verifies the
+    change and returns the device's new state."""
+    started = time.perf_counter()
     try:
         text = HA.control(command)
+        _log_tool("ha_control", started, ok=True)
     except HAError as e:
+        _log_tool("ha_control", started, ok=False, detail=str(e))
         return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
 
@@ -210,10 +308,13 @@ def ha_announce(message: str) -> CallToolResult:
     house ...". message is ONLY the words to speak, with the routing phrase
     stripped (for "tell the house dinner is ready", message is "dinner is
     ready"). Keep it short. Returns the number of speakers it played on."""
+    started = time.perf_counter()
     try:
         text = HA.announce(message)
+        _log_tool("ha_announce", started, ok=True)
     except HAError as e:
-        return _spoken_response(str(e), question=command)
+        _log_tool("ha_announce", started, ok=False, detail=str(e))
+        return _spoken_response(str(e), question=message)
     return _spoken_response(text, question=message)
 
 
@@ -227,9 +328,12 @@ def vinyl_lookup(command: str) -> CallToolResult:
     plain text, e.g. "do I own Eternal Blue by Spiritbox", "pick a random
     record", "most played records this year". Returns what they own,
     including pressing counts."""
+    started = time.perf_counter()
     try:
         text = VINYL.lookup(command)
+        _log_tool("vinyl_lookup", started, ok=True)
     except VinylError as e:
+        _log_tool("vinyl_lookup", started, ok=False, detail=str(e))
         return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
 
@@ -240,13 +344,86 @@ def ha_music(command: str) -> CallToolResult:
 
     Use for requests like "play Spiritbox in the basement", "play the album
     Blue Rev in the kitchen", "play the song Granite", or "stop the music in
-    the living room". command is the spoken request. No room named means the
-    Voice PE speaker. Verifies playback started and returns what is playing."""
+    the living room". command is the spoken request. No room named uses the
+    default speaker. Verifies playback started and returns what is playing."""
+    started = time.perf_counter()
     try:
         text = HA.music(command)
+        _log_tool("ha_music", started, ok=True)
     except HAError as e:
+        _log_tool("ha_music", started, ok=False, detail=str(e))
         return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)
+
+
+@mcp.tool()
+def shopping_list(command: str) -> CallToolResult:
+    """Read, add to, or check off items on the Home Assistant shopping list.
+
+    ALWAYS use this for shopping or grocery list requests like "add oat milk
+    to the shopping list", "we need milk and eggs", "what's on the shopping
+    list", or "check off milk". command is the spoken request in plain text."""
+    started = time.perf_counter()
+    try:
+        text = HA.shopping_list(command)
+        _log_tool("shopping_list", started, ok=True)
+    except HAError as e:
+        _log_tool("shopping_list", started, ok=False, detail=str(e))
+        return _spoken_response(str(e), question=command)
+    return _spoken_response(text, question=command)
+
+
+@mcp.tool()
+def weather_report(query: str = "weather") -> CallToolResult:
+    """Get local home weather, forecast, or sunrise/sunset times from Home Assistant.
+
+    ALWAYS use this instead of web_search for local weather questions like
+    "what's the weather", "do I need a jacket", "will it rain Thursday", or
+    "when is sunset". Fast and local."""
+    started = time.perf_counter()
+    try:
+        text = HA.weather(query)
+        _log_tool("weather_report", started, ok=True)
+    except HAError as e:
+        _log_tool("weather_report", started, ok=False, detail=str(e))
+        return _spoken_response(str(e), question=query)
+    return _spoken_response(text, question=query)
+
+
+@mcp.tool()
+def calendar_lookup(query: str = "this week") -> CallToolResult:
+    """Check the user's Fastmail calendar schedule or search for an event.
+
+    ALWAYS use this for schedule questions like "what's on my calendar
+    today", "what do I have tomorrow", "what's happening next week",
+    "am I free December 5th", or "when is the flea market"."""
+    started = time.perf_counter()
+    try:
+        text = CALENDAR.lookup(query)
+        _log_tool("calendar_lookup", started, ok=True)
+    except CalendarError as e:
+        _log_tool("calendar_lookup", started, ok=False, detail=str(e))
+        return _spoken_response(str(e), question=query)
+    return _spoken_response(text, question=query)
+
+
+@mcp.tool()
+def quick_calc(expression: str) -> CallToolResult:
+    """Deterministic math, unit conversions, mead ABV, tip/split, and dice/coin.
+
+    ALWAYS use this for arithmetic, percentages ("15% of 240", "20% off $80"),
+    tips and bill splits ("split 84 3 ways", "20% tip on 64.50", "tip on 64.50"),
+    unit conversions ("350 F to C", "12 oz in ml"), mead gravity ABV ("abv
+    1.105 to 1.000"), coin flips ("flip a coin"), or dice rolls ("roll 2d6").
+    Never guess math or randomness in the LLM."""
+    started = time.perf_counter()
+    try:
+        text = eval_calc(expression)
+        _log_tool("quick_calc", started, ok=True)
+    except CalcError as e:
+        _log_tool("quick_calc", started, ok=False, detail=str(e))
+        return _spoken_response(str(e), question=expression)
+    return _spoken_response(text, question=expression)
 
 
 _GENERIC_PERSONA = (
@@ -256,24 +433,46 @@ _GENERIC_PERSONA = (
     "- Answer in at most 3 short sentences. No markdown. The answer is "
     "shown as a phone notification.\n"
     "- Facts about the vault must come from vault_search or vault_read. "
-    "Never invent note contents or file names.\n"
-    "- When asked to save something, use vault_append; if the target note "
+    "Never invent note contents or file names. After reading or searching "
+    "the vault, call respond(answer) with your summary so it appears in the "
+    "phone notification.\n"
+    "- When asked to save a note, use vault_append; if the target note "
     "is unclear, use Inbox.md.\n"
-    "- For anything beyond the vault, forward to ask_hermes rather than "
-    "guessing.\n"
-    "- For news, weather, prices, scores, or anything current, use "
-    "web_search first, then answer from its results.\n"
-    "- If you do not know, say so."
+    "- For smart-home commands (lights, switches, fans, covers, TVs), "
+    "ALWAYS use ha_control.\n"
+    "- For house intercom/announcement requests, ALWAYS use ha_announce "
+    "with only the words to speak.\n"
+    "- For music playback/stop requests on house speakers, ALWAYS use ha_music.\n"
+    "- For shopping/grocery list items, ALWAYS use shopping_list.\n"
+    "- For local weather, forecast, rain, sunrise, or sunset, ALWAYS use "
+    "weather_report instead of web_search.\n"
+    "- For schedule, calendar, appointments, or when an event is, ALWAYS "
+    "use calendar_lookup.\n"
+    "- For math, percentages, discounts, unit conversions, tips, bill "
+    "splits, ABV, coin flips, or dice rolls, ALWAYS use quick_calc.\n"
+    "- For vinyl record collection lookups, ALWAYS use vinyl_lookup.\n"
+    "- For news, prices, scores, or live web facts, use web_search.\n"
+    "- For general knowledge questions not covered by a dedicated tool, "
+    "call respond(answer) with a 1-3 sentence plain-text answer.\n"
+    "- If you do not know, say so via respond(answer)."
 )
+
+_PERSONA_CACHE: tuple[str, float, str] | None = None
 
 
 def _ring_persona_text() -> str:
+    global _PERSONA_CACHE
     # Operators can override the generic persona with their own file
     # (e.g. to teach the agent the user's name, hobbies, and vault layout).
     path = os.environ.get("RING_PERSONA_FILE", "").strip()
     if path:
         try:
-            return open(path, encoding="utf-8").read().strip()
+            mtime = os.path.getmtime(path)
+            if _PERSONA_CACHE and _PERSONA_CACHE[0] == path and _PERSONA_CACHE[1] == mtime:
+                return _PERSONA_CACHE[2]
+            text = open(path, encoding="utf-8").read().strip()
+            _PERSONA_CACHE = (path, mtime, text)
+            return text
         except OSError:
             logger.warning("RING_PERSONA_FILE unreadable (%s); using generic persona", path)
     return _GENERIC_PERSONA
@@ -338,6 +537,9 @@ def make_app():
     async def auth_app(scope, receive, send):
         if scope["type"] != "http":
             return await inner(scope, receive, send)
+        if scope.get("path") == "/healthz" and scope.get("method") in ("GET", "HEAD"):
+            response = JSONResponse({"ok": True}, status_code=200)
+            return await response(scope, receive, send)
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization", b"").decode("latin-1")
         if not TOKEN or not hmac.compare_digest(auth, expected):

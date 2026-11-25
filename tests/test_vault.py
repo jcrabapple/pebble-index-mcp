@@ -77,6 +77,20 @@ class TestAppend:
         assert lines[0] == "- 08:00 first"
         assert lines[1].endswith("second")
 
+    def test_append_includes_date_and_resolves_md(self, vault):
+        import re
+
+        existing = vault.root / "Mead Log.md"
+        existing.write_text("# Mead Log\n")
+        out = vault.append("mead log", "racked the cyser")
+        assert out == "Appended to Mead Log.md"
+        text = existing.read_text()
+        assert re.search(r"- \d{4}-\d{2}-\d{2} \d{2}:\d{2} racked the cyser", text)
+
+        out2 = vault.append("Quick Note", "hello")
+        assert out2 == "Appended to Quick Note.md"
+        assert (vault.root / "Quick Note.md").is_file()
+
 
 class TestRead:
     def test_reads_note(self, vault):
@@ -90,6 +104,12 @@ class TestRead:
     def test_truncates(self, vault):
         (vault.root / "n.md").write_text("x" * 100)
         assert vault.read("n.md", max_chars=10) == "x" * 10 + "..."
+
+    def test_reads_tail(self, vault):
+        (vault.root / "Inbox.md").write_text("old entry\n" * 20 + "LATEST ENTRY")
+        out = vault.read("Inbox", max_chars=25, tail=True)
+        assert out.startswith("...")
+        assert out.endswith("LATEST ENTRY")
 
 
 class TestSearch:
@@ -106,11 +126,6 @@ class TestSearch:
         (vault.root / ".obsidian" / "cfg.json").write_text("cyser cfg")
         (vault.root / "real.md").write_text("no cyser here")
         out = vault.search("cyser")
-        # NOTE: spec literally had `assert "real.md" not in out`, but the
-        # setup writes "cyser" into real.md, so real.md is a legitimate
-        # match and must appear. The test's stated purpose is to verify the
-        # HIDDEN dir is excluded, so we assert the hidden dir/file is absent
-        # instead (and the legit match is present). This is strictly stronger.
         assert ".obsidian" not in out
         assert "cfg.json" not in out
         assert "real.md" in out
@@ -119,3 +134,16 @@ class TestSearch:
         (vault.root / "code.md").write_text("use a|b as a separator")
         out = vault.search("a|b")
         assert "code.md" in out
+
+    def test_filename_and_multi_term_search(self, vault):
+        (vault.root / "Mead").mkdir()
+        (vault.root / "Mead" / "Cyser Recipe.md").write_text("# Apple Cyser\nOG 1.105")
+        (vault.root / "Research").mkdir()
+        (vault.root / "Research" / "unrelated.md").write_text("Carver Mead invented neuromorphic chips")
+        out = vault.search("mead cyser")
+        lines = out.splitlines()
+        assert lines[0].startswith("Mead/Cyser Recipe.md:")
+
+        # Multi-term across filename + body even when terms aren't adjacent
+        out2 = vault.search("cyser 1.105")
+        assert "Mead/Cyser Recipe.md" in out2

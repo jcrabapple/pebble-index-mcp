@@ -25,11 +25,24 @@ class HermesError(Exception):
 
 
 class HermesClient:
-    def __init__(self, url: str, api_key: str, model: str, timeout: float = 60.0):
+    def __init__(
+        self,
+        url: str,
+        api_key: str,
+        model: str,
+        timeout: float = 60.0,
+        provider_order: str = "",
+        api_provider: str = "",
+        reasoning_effort: str = "",
+    ):
         self.url = url
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.provider_order = [p.strip() for p in provider_order.split(",") if p.strip()]
+        self.api_provider = api_provider
+        self.reasoning_effort = reasoning_effort
+        self._client = httpx.Client(timeout=timeout)
 
     def ask(self, question: str) -> str:
         """Send a question to the Hermes API server and return its answer."""
@@ -52,9 +65,19 @@ class HermesClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            "max_tokens": 200,
         }
+        if self.api_provider:
+            payload["provider"] = self.api_provider
+        elif self.provider_order:
+            payload["provider"] = {
+                "order": self.provider_order,
+                "allow_fallbacks": True,
+            }
+        if self.reasoning_effort:
+            payload["model_options"] = {"reasoning_effort": self.reasoning_effort}
         try:
-            r = httpx.post(
+            r = self._client.post(
                 url=self.url,
                 json=payload,
                 headers={"Authorization": f"Bearer {self.api_key}"},

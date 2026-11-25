@@ -43,11 +43,17 @@ class VinylClient:
     def __init__(self, url: str = "", timeout: float = _TIMEOUT):
         self.url = url.rstrip("/")
         self.timeout = timeout
+        self._client = httpx.Client(timeout=timeout)
 
     # -- transport -----------------------------------------------------------
 
     def _get_raw(self, url: str) -> tuple[int, Any]:
-        r = httpx.get(url, timeout=self.timeout)
+        try:
+            r = self._client.get(url, timeout=self.timeout)
+        except httpx.TimeoutException as e:
+            raise VinylError(f"Catalog timeout: {e}") from e
+        except httpx.TransportError as e:
+            raise VinylError(f"Catalog transport error: {e}") from e
         return r.status_code, _safe_json(r)
 
     def _get(self, path: str) -> Any:

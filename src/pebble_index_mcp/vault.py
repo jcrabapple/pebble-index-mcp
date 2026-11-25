@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -47,17 +49,34 @@ class Vault:
         except OSError as e:
             raise VaultAccessError(str(e)) from e
 
+    def _resolve_note(self, rel: str, *, for_write: bool = False) -> tuple[Path, str]:
+        """Resolve a note path, matching case-insensitive .md when extension omitted."""
+        p = self._resolve(rel)
+        if p.exists() or p.is_symlink() or p.suffix:
+            return p, rel
+        parent = p.parent
+        target_md = f"{p.name.lower()}.md"
+        if parent.is_dir():
+            for child in sorted(parent.iterdir()):
+                if child.name.lower() == target_md and child.is_file():
+                    matched_rel = str(child.relative_to(self.root))
+                    return self._resolve(matched_rel), matched_rel
+        if for_write:
+            md_rel = f"{rel}.md"
+            return self._resolve(md_rel), md_rel
+        return p, rel
+
     def append(self, rel: str, text: str) -> str:
-        """Append a timestamped line to a note, creating it if absent."""
+        """Append a dated timestamped line to a note, creating it if absent."""
         if not text.strip():
             raise VaultAccessError("Empty text")
-        p = self._resolve(rel)
-        stamp = datetime.datetime.now().strftime("%H:%M")
+        p, display_rel = self._resolve_note(rel, for_write=True)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         line = f"- {stamp} {text.strip()}"
         with self._append_lock:
             try:
                 if p.exists() and not p.is_file():
-                    raise VaultAccessError(f"Not a regular file: {rel}")
+                    raise VaultAccessError(f"Not a regular file: {display_rel}")
                 p.parent.mkdir(parents=True, exist_ok=True)
                 if p.exists() and p.stat().st_size > 0:
                     fd = self._open_nofollow(p, os.O_RDONLY)
@@ -72,52 +91,186 @@ class Vault:
                 raise
             except OSError as e:
                 raise VaultAccessError(str(e)) from e
-        return f"Appended to {rel}"
+        return f"Appended to {display_rel}"
 
-    def read(self, rel: str, max_chars: int = 1500) -> str:
-        """Read up to max_chars of a note, truncating with an ellipsis."""
+    def read(self, rel: str, max_chars: int = 1500, tail: bool = False) -> str:
+        """Read up to max_chars of a note (from head or tail), truncating with ellipsis."""
         max_chars = max(1, min(int(max_chars), 4000))
-        p = self._resolve(rel)
+        p, display_rel = self._resolve_note(rel, for_write=False)
         if not p.is_file():
-            raise VaultAccessError(f"Note not found: {rel}")
+            raise VaultAccessError(f"Note not found: {display_rel}")
         try:
             fd = self._open_nofollow(p, os.O_RDONLY)
             with os.fdopen(fd, "rb") as f:
                 text = f.read().decode("utf-8", errors="replace")
         except OSError as e:
             raise VaultAccessError(str(e)) from e
-        return text[:max_chars] + ("..." if len(text) > max_chars else "")
+        if len(text) <= max_chars:
+            return text
+        if tail:
+            return "..." + text[-max_chars:]
+        return text[:max_chars] + "..."
 
-    def search(self, query: str, max_results: int = 5) -> str:
-        """Search vault notes for a fixed string via ripgrep, return excerpts."""
-        max_results = max(1, min(int(max_results), 10))
+    def _first_excerpt(self, path: Path, terms: list[str] | None = None) -> str:
+        """Read a short representative line from a note for search previews."""
         try:
-            files = subprocess.run(
-                ["rg", "-l", "-i", "-F", "-I", "--", query, str(self.root)],
-                capture_output=True, text=True, timeout=15,
-            )
-        except FileNotFoundError:
-            return "Search unavailable (ripgrep not installed)"
-        except subprocess.TimeoutExpired:
-            return "Search timed out"
-        if files.returncode == 2:
-            return "Search error (invalid query)"
-        paths = [line for line in files.stdout.splitlines() if line.strip()][:max_results]
-        if not paths:
-            return "No matches."
-        out = []
-        for p in paths:
+            fd = self._open_nofollow(path, os.O_RDONLY)
+            with os.fdopen(fd, "rb") as f:
+                text = f.read(32768).decode("utf-8", errors="replace")
+        except (VaultAccessError, OSError):
+            return ""
+        first_nonempty = ""
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line == "---":
+                continue
+            if not first_nonempty:
+                first_nonempty = line
+            if terms and any(t in line.lower() for t in terms):
+                return line[:200]
+        return first_nonempty[:200]
+
+    def _filename_matches(self, terms: list[str], limit: int) -> list[tuple[str, str]]:
+        """Find non-hidden markdown notes whose relative path contains all terms."""
+        hits: list[tuple[str, str]] = []
+        if not terms:
+            return hits
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for fname in sorted(filenames):
+                if fname.startswith(".") or not fname.lower().endswith(".md"):
+                    continue
+                full = Path(dirpath) / fname
+                try:
+                    rel = str(full.relative_to(self.root))
+                except ValueError:
+                    continue
+                rel_low = rel.lower()
+                if all(t in rel_low for t in terms):
+                    excerpt = self._first_excerpt(full, terms)
+                    hits.append((rel, excerpt or "(filename match)"))
+                    if len(hits) >= limit:
+                        return hits
+        return hits
+
+    def _rg_fixed_matches(self, query: str, limit: int) -> list[tuple[str, str]]:
+        """Run fixed-string ripgrep and return (rel_path, excerpt) pairs."""
+        proc = subprocess.run(
+            [
+                "rg",
+                "--json",
+                "-i",
+                "-F",
+                "-I",
+                "--max-count",
+                "1",
+                "--",
+                query,
+                str(self.root),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 2:
+            raise VaultAccessError("Search error (invalid query)")
+        out: list[tuple[str, str]] = []
+        for raw in proc.stdout.splitlines():
+            if len(out) >= limit:
+                break
             try:
-                rel = str(Path(p).relative_to(self.root))
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            if msg.get("type") != "match":
+                continue
+            data = msg.get("data") or {}
+            path_text = (data.get("path") or {}).get("text")
+            if not path_text:
+                continue
+            try:
+                rel = str(Path(path_text).relative_to(self.root))
+            except ValueError:
+                continue
+            line_text = ((data.get("lines") or {}).get("text") or "").strip()
+            out.append((rel, line_text[:200]))
+        return out
+
+    def _rg_multi_term_matches(self, terms: list[str], limit: int) -> list[tuple[str, str]]:
+        """Find notes containing all terms (across path + body), ranked by filename hit."""
+        anchor = max(terms, key=len)
+        proc = subprocess.run(
+            ["rg", "-i", "-F", "-I", "-l", "--", anchor, str(self.root)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode == 2:
+            return []
+        hits: list[tuple[str, str]] = []
+        for path_text in proc.stdout.splitlines():
+            if len(hits) >= limit:
+                break
+            full = Path(path_text)
+            try:
+                rel = str(full.relative_to(self.root))
             except ValueError:
                 continue
             try:
-                excerpt = subprocess.run(
-                    ["rg", "-i", "-F", "-I", "--max-count", "1", "--", query, p],
-                    capture_output=True, text=True, timeout=15,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired):
+                fd = self._open_nofollow(full, os.O_RDONLY)
+                with os.fdopen(fd, "rb") as f:
+                    text = f.read(131072).decode("utf-8", errors="replace")
+            except (VaultAccessError, OSError):
                 continue
-            first = excerpt.stdout.splitlines()[0].strip() if excerpt.stdout.strip() else ""
-            out.append(f"{rel}: {first[:200]}")
-        return "\n".join(out)
+            haystack = f"{rel}\n{text}".lower()
+            if not all(t in haystack for t in terms):
+                continue
+            excerpt = ""
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line and any(t in line.lower() for t in terms):
+                    excerpt = line[:200]
+                    break
+            hits.append((rel, excerpt or "(match)"))
+        return hits
+
+    def search(self, query: str, max_results: int = 5) -> str:
+        """Search vault notes by filename + fixed-string + multi-term content match."""
+        q = query.strip()
+        if not q:
+            return "No matches."
+        max_results = max(1, min(int(max_results), 10))
+        terms = [t for t in re.split(r"\s+", q.lower()) if t]
+
+        combined: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def _add(items: list[tuple[str, str]]) -> None:
+            for rel, excerpt in items:
+                if rel not in seen and len(combined) < max_results:
+                    seen.add(rel)
+                    combined.append((rel, excerpt))
+
+        # 1. Filename/path matches rank first (e.g. Mead/Cyser.md beats random mentions)
+        _add(self._filename_matches(terms, max_results))
+
+        # 2. Exact fixed-string ripgrep matches (preserves literal punctuation like "a|b")
+        try:
+            if len(combined) < max_results:
+                _add(self._rg_fixed_matches(q, max_results * 2))
+            # 3. Multi-term AND search across path + file body when exact phrase wasn't enough
+            if len(terms) > 1 and len(combined) < max_results:
+                _add(self._rg_multi_term_matches(terms, max_results * 2))
+        except FileNotFoundError:
+            if not combined:
+                return "Search unavailable (ripgrep not installed)"
+        except subprocess.TimeoutExpired:
+            if not combined:
+                return "Search timed out"
+        except VaultAccessError as e:
+            if not combined:
+                return str(e)
+
+        if not combined:
+            return "No matches."
+        return "\n".join(f"{rel}: {excerpt}" for rel, excerpt in combined)

@@ -62,6 +62,15 @@ async def test_unauthorized_bad_token(app_with_token):
     assert r.status_code == 401
 
 
+async def test_healthz_unauthenticated(app_with_token):
+    async with _client(app_with_token) as client:
+        r = await client.get("/healthz")
+        r_head = await client.head("/healthz")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert r_head.status_code == 200
+
+
 @pytest.fixture()
 def app_empty_token(monkeypatch):
     monkeypatch.setenv("MCP_BEARER_TOKEN", "")
@@ -146,6 +155,13 @@ def test_vault_tool_without_vault_path(monkeypatch):
 
 
 def _reload(monkeypatch, **env):
+    for clear_key in (
+        "HERMES_AGENT_API_URL",
+        "HERMES_AGENT_API_KEY",
+        "ENABLE_ASK_HERMES",
+        "RING_PERSONA_FILE",
+    ):
+        monkeypatch.delenv(clear_key, raising=False)
     monkeypatch.setenv("MCP_BEARER_TOKEN", "sekret")
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -208,6 +224,85 @@ def test_ask_hermes_returns_core_schema_response(monkeypatch):
     assert r.structuredContent["semanticResult"]["type"] == "Response"
     assert r.structuredContent["semanticResult"]["text"] == "Two plus two is four."
     assert r.structuredContent["output"] == "Two plus two is four."
+
+
+def test_hermes_task_uses_full_agent(monkeypatch):
+    srv = _reload(
+        monkeypatch,
+        VAULT_PATH="",
+        HERMES_AGENT_API_URL="http://hermes/v1/chat/completions",
+        HERMES_AGENT_API_KEY="agent-key",
+    )
+    monkeypatch.setattr(srv.HERMES_AGENT, "ask", lambda task: "Hermes handled it.")
+
+    r = srv.hermes_task("ask Hermes to handle this")
+    assert r.structuredContent["semanticResult"] == {
+        "type": "Response",
+        "text": "Hermes handled it.",
+        "question": "ask Hermes to handle this",
+    }
+
+
+def test_hermes_task_without_agent_configuration(monkeypatch):
+    srv = _reload(monkeypatch, VAULT_PATH="")
+    r = srv.hermes_task("do something")
+    assert "not configured" in r.structuredContent["semanticResult"]["text"]
+
+
+def test_ha_announce_error_returns_original_message(monkeypatch):
+    srv = _reload(monkeypatch, VAULT_PATH="")
+
+    def fail(message):
+        raise srv.HAError("No available speaker")
+
+    monkeypatch.setattr(srv.HA, "announce", fail)
+    r = srv.ha_announce("dinner is ready")
+    assert r.structuredContent["semanticResult"] == {
+        "type": "Response",
+        "text": "No available speaker",
+        "question": "dinner is ready",
+    }
+
+
+def test_respond_returns_core_schema_without_llm(monkeypatch):
+    srv = _reload(monkeypatch, VAULT_PATH="")
+    r = srv.respond("  Helena is the capital of Montana.  ")
+    assert r.meta == {"coreSchema": 1}
+    assert r.structuredContent["semanticResult"] == {
+        "type": "Response",
+        "text": "Helena is the capital of Montana.",
+    }
+
+
+def test_vault_append_returns_core_schema_response(monkeypatch, tmp_path):
+    srv = _reload(monkeypatch, VAULT_PATH=str(tmp_path))
+    r = srv.vault_append("Inbox.md", "buy yeast")
+    assert r.meta == {"coreSchema": 1}
+    assert r.structuredContent["semanticResult"]["text"] == "Appended to Inbox.md"
+    assert (tmp_path / "Inbox.md").is_file()
+
+
+def test_new_deterministic_tools_wrap_spoken_response(monkeypatch):
+    srv = _reload(monkeypatch, VAULT_PATH="")
+    monkeypatch.setattr(srv.HA, "shopping_list", lambda cmd: "Added oat milk to the shopping list.")
+    monkeypatch.setattr(srv.HA, "weather", lambda q: "Currently 44°F and sunny.")
+    monkeypatch.setattr(srv.CALENDAR, "lookup", lambda q: "Nothing on the calendar for today.")
+
+    r_shop = srv.shopping_list("add oat milk")
+    assert r_shop.meta == {"coreSchema": 1}
+    assert r_shop.structuredContent["semanticResult"]["text"] == "Added oat milk to the shopping list."
+
+    r_wea = srv.weather_report("what is the weather")
+    assert r_wea.meta == {"coreSchema": 1}
+    assert r_wea.structuredContent["semanticResult"]["text"] == "Currently 44°F and sunny."
+
+    r_cal = srv.calendar_lookup("today")
+    assert r_cal.meta == {"coreSchema": 1}
+    assert r_cal.structuredContent["semanticResult"]["text"] == "Nothing on the calendar for today."
+
+    r_calc = srv.quick_calc("350 F to C")
+    assert r_calc.meta == {"coreSchema": 1}
+    assert "176.7°C" in r_calc.structuredContent["semanticResult"]["text"]
 
 
 async def test_prompts_list_arguments_null(app_with_token):

@@ -18,6 +18,10 @@ def _client():
     return ExaClient(api_key="exa-key-123")
 
 
+def _stub_post(monkeypatch, client, fake_post):
+    monkeypatch.setattr(client._client, "post", fake_post)
+
+
 def test_search_success_formats_results(monkeypatch):
     captured = {}
 
@@ -33,8 +37,9 @@ def test_search_success_formats_results(monkeypatch):
             },
         )
 
-    monkeypatch.setattr("pebble_index_mcp.websearch.httpx.post", fake_post)
-    out = _client().search("who won the game", num_results=2)
+    c = _client()
+    _stub_post(monkeypatch, c, fake_post)
+    out = c.search("who won the game", num_results=2)
     assert "Result A" in out and "https://a.example/x" in out and "Snippet A" in out
     assert "Result B" in out
     assert captured["url"] == "https://api.exa.ai/search"
@@ -51,17 +56,16 @@ def test_search_snippet_truncated(monkeypatch):
             200, {"results": [{"title": "T", "url": "https://a", "text": long_text}]}
         )
 
-    monkeypatch.setattr("pebble_index_mcp.websearch.httpx.post", fake_post)
-    out = _client().search("q")
+    c = _client()
+    _stub_post(monkeypatch, c, fake_post)
+    out = c.search("q")
     assert out.count("x") < 1000
 
 
 def test_search_no_results(monkeypatch):
-    monkeypatch.setattr(
-        "pebble_index_mcp.websearch.httpx.post",
-        lambda **kwargs: FakeResponse(200, {"results": []}),
-    )
-    out = _client().search("q")
+    c = _client()
+    _stub_post(monkeypatch, c, lambda **kwargs: FakeResponse(200, {"results": []}))
+    out = c.search("q")
     assert "No results" in out
 
 
@@ -71,11 +75,10 @@ def test_search_http_error(monkeypatch):
             super().__init__(401)
             self.text = "bad key"
 
-    monkeypatch.setattr(
-        "pebble_index_mcp.websearch.httpx.post", lambda **kwargs: BodyResponse()
-    )
+    c = _client()
+    _stub_post(monkeypatch, c, lambda **kwargs: BodyResponse())
     with pytest.raises(ExaError) as exc:
-        _client().search("q")
+        c.search("q")
     assert "HTTP 401" in str(exc.value)
 
 
@@ -83,27 +86,27 @@ def test_search_timeout(monkeypatch):
     def fake_post(**kwargs):
         raise httpx.TimeoutException("slow")
 
-    monkeypatch.setattr("pebble_index_mcp.websearch.httpx.post", fake_post)
+    c = _client()
+    _stub_post(monkeypatch, c, fake_post)
     with pytest.raises(ExaError):
-        _client().search("q")
+        c.search("q")
 
 
 def test_search_connect_error(monkeypatch):
     def fake_post(**kwargs):
         raise httpx.ConnectError("refused")
 
-    monkeypatch.setattr("pebble_index_mcp.websearch.httpx.post", fake_post)
+    c = _client()
+    _stub_post(monkeypatch, c, fake_post)
     with pytest.raises(ExaError):
-        _client().search("q")
+        c.search("q")
 
 
 def test_search_bad_shape(monkeypatch):
-    monkeypatch.setattr(
-        "pebble_index_mcp.websearch.httpx.post",
-        lambda **kwargs: FakeResponse(200, {"nope": 1}),
-    )
+    c = _client()
+    _stub_post(monkeypatch, c, lambda **kwargs: FakeResponse(200, {"nope": 1}))
     with pytest.raises(ExaError):
-        _client().search("q")
+        c.search("q")
 
 
 def test_missing_key_short_circuits():

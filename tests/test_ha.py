@@ -1,6 +1,11 @@
 import pytest
 
-from pebble_index_mcp.homeassistant import HAError, HAClient, parse_command
+from pebble_index_mcp.homeassistant import (
+    HAError,
+    HAClient,
+    parse_command,
+    parse_music_rooms_env,
+)
 
 
 def _state(entity_id, friendly, state="off", domain=None):
@@ -25,14 +30,15 @@ def _states():
         _state("light.bedroom_bedroom", "Bedroom", "unavailable"),
         _state("light.bedroom_bedroom_2", "Bedroom"),
         _state("light.storage_closet_storage_closet", "Storage Closet"),
-        _state("light.jason_s_lamp", "Jason's lamp"),
+        _state("light.alex_s_lamp", "Alex's lamp"),
+        _state("cover.office_blinds", "Office Blinds", "closed"),
         _state("media_player.living_room_tv_2", "Living Room TV", "paused"),
-        _state("switch.home_assistant_voice_09f284_mute", "Home Assistant Voice Mute"),
+        _state("switch.home_assistant_voice_mute", "Home Assistant Voice Mute"),
     ]
 
 
-def _client():
-    return HAClient(url="http://ha.test:8123", token="ha-token")
+def _client(**kwargs):
+    return HAClient(url="http://ha.test:8123", token="ha-token", **kwargs)
 
 
 # --- parse_command ---------------------------------------------------------
@@ -106,16 +112,16 @@ def test_resolve_skips_unavailable_duplicate():
 
 
 def test_parse_possessive_splits_apostrophe():
-    # "jason's" must tokenize as jason/s, not a dead "jason's" token that
-    # singularize() mangles into "jason'"
-    action, target = parse_command("turn on Jason's lamp")
+    # "alex's" must tokenize as alex/s, not a dead "alex's" token that
+    # singularize() mangles into "alex'"
+    action, target = parse_command("turn on Alex's lamp")
     assert action == "on"
-    assert target == ["jason", "lamp"]
+    assert target == ["alex", "lamp"]
 
 
 def test_resolve_possessive_entity():
-    entity = _resolve(_client(), ["jason", "lamp"])
-    assert entity["entity_id"] == "light.jason_s_lamp"
+    entity = _resolve(_client(), ["alex", "lamp"])
+    assert entity["entity_id"] == "light.alex_s_lamp"
 
 
 def test_control_possessive_end_to_end(monkeypatch):
@@ -123,9 +129,28 @@ def test_control_possessive_end_to_end(monkeypatch):
     fake = FakeHA(_states())
     monkeypatch.setattr(c, "_get_raw", fake.get)
     monkeypatch.setattr(c, "_post_raw", fake.post)
-    out = c.control("turn on Jason's lamp")
-    assert fake.posts[0][1] == {"entity_id": "light.jason_s_lamp"}
+    out = c.control("turn on Alex's lamp")
+    assert fake.posts[0][1] == {"entity_id": "light.alex_s_lamp"}
     assert "now on" in out
+
+
+def test_control_cover_open_and_close(monkeypatch):
+    c = _client()
+    fake = FakeHA(_states())
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    # Already closed -> short-circuits instead of toggling open
+    out_closed = c.control("close office blinds")
+    assert fake.posts == []
+    assert "already closed" in out_closed
+    # Open calls open_cover, not toggle
+    out_open = c.control("open office blinds")
+    assert fake.posts[0][0] == "/api/services/cover/open_cover"
+    assert "now open" in out_open
+    # Close calls close_cover
+    out_close = c.control("close office blinds")
+    assert fake.posts[1][0] == "/api/services/cover/close_cover"
+    assert "now closed" in out_close
 
 
 def test_resolve_media_player():
@@ -189,6 +214,8 @@ class FakeHA:
                 "turn_on": "on",
                 "turn_off": "off",
                 "toggle": "on",
+                "open_cover": "open",
+                "close_cover": "closed",
             }.get(svc)
             for s in self.states:
                 if s["entity_id"] == eid and new_state:
@@ -272,6 +299,12 @@ def test_announce_empty_message(monkeypatch):
         _client().announce("   ")
 
 
+def test_announce_missing_token():
+    c = HAClient(url="http://ha.test:8123", token="")
+    with pytest.raises(HAError, match="HASS_TOKEN"):
+        c.announce("hello")
+
+
 # --- music (Music Assistant via HA) -----------------------------------------
 
 def _mu_state(entity_id, state="idle", **attrs):
@@ -280,12 +313,13 @@ def _mu_state(entity_id, state="idle", **attrs):
 
 def _music_states():
     return [
-        _mu_state("media_player.home_assistant_voice_09f284"),
-        _mu_state("media_player.basement_speaker_1_2"),
-        _mu_state("media_player.clarity_s_vinyl_speaker_2"),
-        _mu_state("media_player.kitchen_display_2"),
-        _mu_state("media_player.sydney_s_room_speaker_2"),
-        _mu_state("media_player.master_bedroom_speaker_2", "unavailable"),
+        _mu_state("media_player.home_assistant_voice_test", friendly_name="Voice PE"),
+        _mu_state("media_player.basement_speaker_1_2", friendly_name="Basement speaker"),
+        _mu_state("media_player.living_room_speaker_2", friendly_name="Living Room"),
+        _mu_state("media_player.kitchen_display_2", friendly_name="Kitchen display"),
+        _mu_state("media_player.taylor_s_room_speaker_2", friendly_name="Taylor's Room Speaker"),
+        _mu_state("media_player.emily_s_room_speaker_2", friendly_name="Emily's Room speaker"),
+        _mu_state("media_player.master_bedroom_speaker_2", "unavailable", friendly_name="Master Bedroom speaker"),
     ]
 
 
@@ -298,22 +332,61 @@ def test_music_play_default_player_and_verify(monkeypatch):
     out = c.music("play Spiritbox")
     url, payload = fake.posts[0]
     assert url == "/api/services/media_player/play_media"
-    assert payload["entity_id"] == "media_player.home_assistant_voice_09f284"
+    assert payload["entity_id"] == "media_player.home_assistant_voice_test"
     assert payload["media_content_type"] == "artist"
     assert payload["media_content_id"] == "spiritbox"
     assert "Circle With Me" in out and "Spiritbox" in out
 
 
+def test_music_default_player_falls_back_when_first_unavailable(monkeypatch):
+    states = _music_states()
+    states[0]["state"] = "unavailable"
+    c = _client(
+        default_players="media_player.home_assistant_voice_test,media_player.living_room_speaker_2"
+    )
+    fake = FakeHA(states)
+    fake.play_queue = [{"media_title": "Granite", "media_artist": "Sleep Token"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play Sleep Token")
+    assert fake.posts[0][1]["entity_id"] == "media_player.living_room_speaker_2"
+    assert "Granite" in out
+
+
 def test_music_room_routing_and_possessive(monkeypatch):
     c = _client()
     fake = FakeHA(_music_states())
-    fake.play_queue = [{"media_title": "Casanova Fluid Hair"}]
+    fake.play_queue = [
+        {"media_title": "Casanova Fluid Hair"},
+        {"media_title": "Casanova Fluid Hair"},
+        {"media_title": "Casanova Fluid Hair"},
+    ]
     monkeypatch.setattr(c, "_get_raw", fake.get)
     monkeypatch.setattr(c, "_post_raw", fake.post)
     c.music("play Bilmuri in the basement")
     assert fake.posts[0][1]["entity_id"] == "media_player.basement_speaker_1_2"
-    c.music("play Bilmuri in Sydney's room")
-    assert fake.posts[-1][1]["entity_id"] == "media_player.sydney_s_room_speaker_2"
+    c.music("play Bilmuri in Taylor's room")
+    assert fake.posts[1][1]["entity_id"] == "media_player.taylor_s_room_speaker_2"
+    # Regression: possessive ending in y ("Emily's room" -> "emilys room") must match
+    c.music("play Bilmuri in Emily's room")
+    assert fake.posts[2][1]["entity_id"] == "media_player.emily_s_room_speaker_2"
+
+
+def test_music_configured_room_alias(monkeypatch):
+    c = _client(music_rooms=parse_music_rooms_env("gym=media_player.basement_speaker_1_2"))
+    fake = FakeHA(_music_states())
+    fake.play_queue = [{"media_title": "Holy Roller", "media_artist": "Spiritbox"}]
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+    out = c.music("play Spiritbox in the gym")
+    assert fake.posts[0][1]["entity_id"] == "media_player.basement_speaker_1_2"
+    assert "Holy Roller" in out
+
+
+def test_music_missing_token():
+    c = HAClient(url="http://ha.test:8123", token="")
+    with pytest.raises(HAError, match="HASS_TOKEN"):
+        c.music("play Spiritbox")
 
 
 def test_music_album_and_track_types(monkeypatch):
@@ -354,7 +427,7 @@ def test_music_stop(monkeypatch):
 
 
 def test_music_unavailable_player(monkeypatch):
-    c = _client()
+    c = _client(music_rooms={"bedroom": "media_player.master_bedroom_speaker_2"})
     fake = FakeHA(_music_states())
     monkeypatch.setattr(c, "_get_raw", fake.get)
     monkeypatch.setattr(c, "_post_raw", fake.post)
@@ -442,3 +515,213 @@ def test_control_http_error(monkeypatch):
     monkeypatch.setattr(c, "_get_raw", boom)
     with pytest.raises(HAError):
         c.control("living room lights on")
+
+
+# --- shopping_list ---------------------------------------------------------
+
+def test_shopping_list_read_items(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(
+        c,
+        "_post",
+        lambda path, payload: {
+            "service_response": {
+                "todo.shopping_list": {
+                    "items": [{"summary": "Milk"}, {"summary": "Oat milk"}]
+                }
+            }
+        },
+    )
+    out = c.shopping_list("what is on my shopping list")
+    assert out == "Shopping list (2 items): Milk, Oat milk."
+
+
+def test_shopping_list_read_empty(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(
+        c,
+        "_post",
+        lambda path, payload: {"service_response": {"todo.shopping_list": {"items": []}}},
+    )
+    assert c.shopping_list("shopping list") == "Your shopping list is empty."
+
+
+def test_shopping_list_add_strips_tail(monkeypatch):
+    c = _client()
+    calls = []
+    monkeypatch.setattr(c, "_post", lambda path, payload: calls.append((path, payload)) or [])
+    out = c.shopping_list("add some oat milk to the shopping list")
+    assert calls[0] == (
+        "/api/services/todo/add_item",
+        {"entity_id": "todo.shopping_list", "item": "oat milk"},
+    )
+    assert out == "Added oat milk to the shopping list."
+
+
+def test_shopping_list_check_off_case_insensitive(monkeypatch):
+    c = _client()
+    calls = []
+
+    def fake_post(path, payload):
+        calls.append((path, payload))
+        if "get_items" in path:
+            return {
+                "service_response": {
+                    "todo.shopping_list": {"items": [{"summary": "Milk"}, {"summary": "Bread"}]}
+                }
+            }
+        return []
+
+    monkeypatch.setattr(c, "_post", fake_post)
+    out = c.shopping_list("check off milk from the shopping list")
+    assert calls[1] == (
+        "/api/services/todo/remove_item",
+        {"entity_id": "todo.shopping_list", "item": "Milk"},
+    )
+    assert out == "Checked off Milk."
+
+
+def test_shopping_list_check_off_missing(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(
+        c,
+        "_post",
+        lambda path, payload: {
+            "service_response": {"todo.shopping_list": {"items": [{"summary": "Milk"}]}}
+        },
+    )
+    out = c.shopping_list("check off eggs")
+    assert "not on the shopping list" in out
+
+
+def test_shopping_list_check_off_does_not_delete_shorter_item(monkeypatch):
+    c = _client()
+    calls = []
+
+    def fake_post(path, payload):
+        calls.append((path, payload))
+        if "get_items" in path:
+            return {"service_response": {"todo.shopping_list": {"items": [{"summary": "Milk"}]}}}
+        return []
+
+    monkeypatch.setattr(c, "_post", fake_post)
+    out = c.shopping_list("check off almond milk")
+    assert "not on the shopping list" in out
+    assert len(calls) == 1  # never called remove_item
+
+
+def test_shopping_list_add_multiple_and_need_phrasing(monkeypatch):
+    c = _client()
+    calls = []
+    monkeypatch.setattr(c, "_post", lambda path, payload: calls.append((path, payload)) or [])
+    out = c.shopping_list("we need milk and eggs")
+    assert [p["item"] for _, p in calls] == ["milk", "eggs"]
+    assert out == "Added milk, eggs to the shopping list."
+
+
+def test_shopping_list_keeps_compound_grocery_item(monkeypatch):
+    c = _client()
+    calls = []
+    monkeypatch.setattr(c, "_post", lambda path, payload: calls.append((path, payload)) or [])
+    out = c.shopping_list("add mac and cheese to the shopping list")
+    assert [p["item"] for _, p in calls] == ["mac and cheese"]
+    assert out == "Added mac and cheese to the shopping list."
+
+
+# --- weather ---------------------------------------------------------------
+
+def test_weather_current_and_forecast(monkeypatch):
+    c = _client()
+
+    def fake_get(path):
+        assert path == "/api/states/weather.home"
+        return {
+            "state": "sunny",
+            "attributes": {
+                "temperature": 44,
+                "temperature_unit": "°F",
+                "wind_speed": 3.4,
+                "wind_speed_unit": "mph",
+            },
+        }
+
+    def fake_post(path, payload):
+        return {
+            "service_response": {
+                "weather.home": {
+                    "forecast": [
+                        {
+                            "datetime": "2026-11-10T00:00:00+00:00",
+                            "condition": "cloudy",
+                            "temperature": 67,
+                            "templow": 40,
+                            "precipitation": 0.0,
+                        },
+                        {
+                            "datetime": "2026-11-11T00:00:00+00:00",
+                            "condition": "rainy",
+                            "temperature": 61,
+                            "templow": 46,
+                            "precipitation": 0.25,
+                        },
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(c, "_get", fake_get)
+    monkeypatch.setattr(c, "_post", fake_post)
+    out = c.weather("what is the weather")
+    assert "Currently 44°F and sunny." in out
+    assert "Today: cloudy, high 67°F, low 40°F." in out
+    assert "Tomorrow: rainy, high 61°F, low 46°F, 0.25 in rain." in out
+
+
+def test_weather_uses_reported_precip_unit(monkeypatch):
+    c = _client()
+    monkeypatch.setattr(
+        c,
+        "_get",
+        lambda path: {
+            "state": "rainy",
+            "attributes": {
+                "temperature": 12,
+                "temperature_unit": "°C",
+                "precipitation_unit": "mm",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        c,
+        "_post",
+        lambda path, payload: {
+            "service_response": {
+                "weather.home": {
+                    "forecast": [
+                        {
+                            "datetime": "2026-11-10T00:00:00+00:00",
+                            "condition": "rainy",
+                            "temperature": 14,
+                            "templow": 8,
+                            "precipitation": 4.2,
+                        }
+                    ]
+                }
+            }
+        },
+    )
+    out = c.weather("weather")
+    assert "4.2 mm rain" in out
+
+
+def test_weather_sunrise_sunset(monkeypatch):
+    c = _client()
+
+    def fake_get(path):
+        if "rising" in path:
+            return {"state": "2026-11-10T11:48:20+00:00"}
+        return {"state": "2026-11-10T22:03:56+00:00"}
+
+    monkeypatch.setattr(c, "_get", fake_get)
+    out = c.weather("when is sunset")
+    assert "Next sunrise is" in out and "next sunset is" in out
