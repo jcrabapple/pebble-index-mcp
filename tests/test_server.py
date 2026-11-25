@@ -160,6 +160,9 @@ def _reload(monkeypatch, **env):
         "HERMES_AGENT_API_KEY",
         "ENABLE_ASK_HERMES",
         "RING_PERSONA_FILE",
+        "TRIVET_URL",
+        "TRIVET_USER",
+        "TRIVET_PASS",
     ):
         monkeypatch.delenv(clear_key, raising=False)
     monkeypatch.setenv("MCP_BEARER_TOKEN", "sekret")
@@ -205,7 +208,7 @@ def test_web_search_falls_back_to_plain_text_without_compose(monkeypatch):
 
 
 def test_web_search_exa_error_is_content(monkeypatch):
-    srv = _reload(monkeypatch, VAULT_PATH="")
+    srv = _reload(monkeypatch, VAULT_PATH="", TRIVET_URL="")
 
     def boom(q, max_results=3):
         raise srv.ExaError("HTTP 500: sad")
@@ -213,6 +216,26 @@ def test_web_search_exa_error_is_content(monkeypatch):
     monkeypatch.setattr(srv.EXA, "search", boom)
     r = srv.web_search("q")
     assert "Web search unavailable" in r.content[0].text
+
+
+def test_web_search_prefers_trivet_and_falls_back_to_exa(monkeypatch):
+    srv = _reload(monkeypatch, VAULT_PATH="", TRIVET_URL="http://trivet.test", EXA_API_KEY="exa-k")
+    monkeypatch.setattr(srv.TRIVET, "search", lambda q, n=3: "Trivet Hit (https://t)\nDetails")
+    monkeypatch.setattr(srv.HERMES, "compose_answer", lambda q, r: "Trivet answered.")
+    r = srv.web_search("test query")
+    assert r.structuredContent["semanticResult"]["text"] == "Trivet answered."
+    assert "Trivet Hit" in r.structuredContent["output"]
+
+    # When Trivet fails, fall back cleanly to Exa
+    def trivet_down(q, n=3):
+        raise srv.TrivetError("connection refused")
+
+    monkeypatch.setattr(srv.TRIVET, "search", trivet_down)
+    monkeypatch.setattr(srv.EXA, "search", lambda q, n=3: "Exa Hit (https://e)\nBackup")
+    monkeypatch.setattr(srv.HERMES, "compose_answer", lambda q, r: "Exa backup answered.")
+    r2 = srv.web_search("test query")
+    assert r2.structuredContent["semanticResult"]["text"] == "Exa backup answered."
+    assert "Exa Hit" in r2.structuredContent["output"]
 
 
 def test_ask_hermes_returns_core_schema_response(monkeypatch):

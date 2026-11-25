@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from pebble_index_mcp.websearch import ExaClient, ExaError
+from pebble_index_mcp.websearch import ExaClient, ExaError, TrivetClient, TrivetError
 
 
 class FakeResponse:
@@ -112,3 +112,33 @@ def test_search_bad_shape(monkeypatch):
 def test_missing_key_short_circuits():
     c = ExaClient(api_key="")
     assert "not configured" in c.search("q").lower()
+
+
+def test_trivet_search_basic_auth_and_news_tab(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        captured.update(url=url, params=params, headers=headers)
+        return FakeResponse(
+            200,
+            {
+                "results": [
+                    {"title": "Launch A", "url": "https://a.example", "snippet": "Friday at 9"},
+                ]
+            },
+        )
+
+    c = TrivetClient(url="http://127.0.0.1:8952", username="u", password="p")
+    monkeypatch.setattr(c._client, "get", fake_get)
+    out = c.search("latest news SpaceX", num_results=2)
+    assert "Launch A" in out and "Friday at 9" in out
+    assert captured["url"] == "http://127.0.0.1:8952/api/search"
+    assert captured["params"] == {"q": "latest news SpaceX", "limit": 2, "tab": "news"}
+    assert captured["headers"]["Authorization"].startswith("Basic ")
+
+
+def test_trivet_search_http_error(monkeypatch):
+    c = TrivetClient(url="http://127.0.0.1:8952")
+    monkeypatch.setattr(c._client, "get", lambda **kw: FakeResponse(503))
+    with pytest.raises(TrivetError):
+        c.search("q")

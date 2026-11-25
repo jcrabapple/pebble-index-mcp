@@ -24,7 +24,7 @@ from .hermes import HermesClient, HermesError, HermesTimeout
 from .homeassistant import HAClient, HAError, parse_music_rooms_env
 from .vault import Vault, VaultAccessError
 from .vinyl import VinylClient, VinylError
-from .websearch import ExaClient, ExaError
+from .websearch import ExaClient, ExaError, TrivetClient, TrivetError
 
 logger = logging.getLogger("pebble_index_mcp")
 if not logger.handlers:
@@ -54,6 +54,11 @@ HERMES = HermesClient(
     provider_order=os.environ.get("RING_PROVIDER_ORDER", ""),
 )
 EXA = ExaClient(api_key=os.environ.get("EXA_API_KEY", ""))
+TRIVET = TrivetClient(
+    url=os.environ.get("TRIVET_URL", "").strip(),
+    username=os.environ.get("TRIVET_USER", "").strip(),
+    password=os.environ.get("TRIVET_PASS", "").strip(),
+)
 HERMES_AGENT = None
 if os.environ.get("HERMES_AGENT_API_URL", "").strip():
     HERMES_AGENT = HermesClient(
@@ -64,8 +69,8 @@ if os.environ.get("HERMES_AGENT_API_URL", "").strip():
         api_provider=os.environ.get("HERMES_AGENT_PROVIDER", ""),
         reasoning_effort=os.environ.get("HERMES_AGENT_REASONING_EFFORT", ""),
     )
-if not EXA.api_key:
-    logger.warning("EXA_API_KEY is not set; web_search will report an error")
+if not TRIVET.url and not EXA.api_key:
+    logger.warning("Neither TRIVET_URL nor EXA_API_KEY is set; web_search will report an error")
 HA = HAClient(
     url=os.environ.get("HASS_URL", "http://127.0.0.1:8123"),
     token=os.environ.get("HASS_TOKEN", ""),
@@ -192,16 +197,29 @@ def _spoken_response(text: str, question: str | None = None) -> CallToolResult:
 def web_search(query: str, max_results: int = 3) -> CallToolResult:
     """Search the live web for current information.
 
-    Use for news, weather, sports scores, prices, schedules, recent events,
-    or anything that changes over time. Returns a short answer composed from
-    live search results, plus the raw results for reference. For questions
-    about the user's notes, prefer vault_search instead.
+    Use for news, sports scores, prices, schedules, recent events, or anything
+    that changes over time. Prefers self-hosted Trivet metasearch when
+    configured (falling back to Exa), then composes a short spoken answer.
+    For local weather prefer weather_report; for notes prefer vault_search.
     """
     started = time.perf_counter()
+    backend = "exa"
     try:
-        results = EXA.search(query, max_results)
+        if TRIVET.url:
+            backend = "trivet"
+            try:
+                results = TRIVET.search(query, max_results)
+            except TrivetError as te:
+                if EXA.api_key:
+                    logger.warning("Trivet search failed (%s); falling back to Exa", te)
+                    backend = "exa-fallback"
+                    results = EXA.search(query, max_results)
+                else:
+                    raise
+        else:
+            results = EXA.search(query, max_results)
     except ExaError as e:
-        logger.info("web_search search failed after %.3fs", time.perf_counter() - started)
+        _log_tool("web_search", started, ok=False, detail=f"{backend}: {e}")
         return CallToolResult(
             content=[TextContent(type="text", text=f"Web search unavailable ({e})")]
         )
@@ -214,7 +232,8 @@ def web_search(query: str, max_results: int = 3) -> CallToolResult:
         answer = None
     compose_done = time.perf_counter()
     logger.info(
-        "web_search timing search=%.3fs compose=%.3fs total=%.3fs",
+        "web_search backend=%s search=%.3fs compose=%.3fs total=%.3fs",
+        backend,
         search_done - started,
         compose_done - search_done,
         compose_done - started,
@@ -283,13 +302,13 @@ if HERMES_AGENT is not None:
 
 @mcp.tool()
 def ha_control(command: str) -> CallToolResult:
-    """Control the user's smart home: lights, switches, fans, covers, and media players.
+    """Control the user's smart home: lights, Hue scenes, dimming, switches, fans, covers, and TVs.
 
     ALWAYS use this for smart-home commands like "living room lights on",
-    "bedroom off", "toggle the hallway", "open the blinds", or "is the
-    living room tv on". command is the spoken request in plain text.
-    Supported actions: on, off, open, close, toggle, status. Verifies the
-    change and returns the device's new state."""
+    "dim living room to 30%", "set basement to relax", "bedroom nightlight
+    scene", "all lights off", "toggle the hallway", "open the blinds", or
+    "is the living room tv on". command is the spoken request in plain text.
+    Verifies state changes and returns the new state."""
     started = time.perf_counter()
     try:
         text = HA.control(command)
@@ -340,12 +359,13 @@ def vinyl_lookup(command: str) -> CallToolResult:
 
 @mcp.tool()
 def ha_music(command: str) -> CallToolResult:
-    """Play or stop music on the house speakers (Deezer via Music Assistant).
+    """Play, control, or query music on the house speakers (Deezer via Music Assistant).
 
-    Use for requests like "play Spiritbox in the basement", "play the album
-    Blue Rev in the kitchen", "play the song Granite", or "stop the music in
-    the living room". command is the spoken request. No room named uses the
-    default speaker. Verifies playback started and returns what is playing."""
+    Use for playback ("play Spiritbox in the basement", "play the album Blue
+    Rev in the kitchen"), transport ("pause", "resume", "skip", "previous",
+    "stop the music"), volume ("volume 40 in the basement", "turn it down",
+    "mute kitchen"), or status ("what's playing"). No room named uses the
+    active playing speaker or default speaker."""
     started = time.perf_counter()
     try:
         text = HA.music(command)
@@ -375,11 +395,12 @@ def shopping_list(command: str) -> CallToolResult:
 
 @mcp.tool()
 def weather_report(query: str = "weather") -> CallToolResult:
-    """Get local home weather, forecast, or sunrise/sunset times from Home Assistant.
+    """Get local home weather, hourly/daily forecast, feels-like, gusts, or sunrise/sunset.
 
     ALWAYS use this instead of web_search for local weather questions like
-    "what's the weather", "do I need a jacket", "will it rain Thursday", or
-    "when is sunset". Fast and local."""
+    "what's the weather", "do I need a jacket", "will it rain tonight",
+    "weather at 5pm", "will it rain Thursday", or "when is sunset". Fast
+    and local."""
     started = time.perf_counter()
     try:
         text = HA.weather(query)

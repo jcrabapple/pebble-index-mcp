@@ -725,3 +725,223 @@ def test_weather_sunrise_sunset(monkeypatch):
     monkeypatch.setattr(c, "_get", fake_get)
     out = c.weather("when is sunset")
     assert "Next sunrise is" in out and "next sunset is" in out
+
+
+# --- Pass 2: scenes, brightness, all-lights, music transport, hourly weather -
+
+def test_control_scenes_brightness_and_all_lights(monkeypatch):
+    c = _client()
+    states = _states() + [
+        {
+            "entity_id": "light.basement_basement",
+            "state": "on",
+            "attributes": {"friendly_name": "Basement", "brightness": 204},
+        },
+        {
+            "entity_id": "scene.basement_basement_relax",
+            "state": "unknown",
+            "attributes": {"friendly_name": "Basement Relax"},
+        },
+        {
+            "entity_id": "scene.living_room_living_room_dimmed",
+            "state": "unknown",
+            "attributes": {"friendly_name": "Living Room Dimmed"},
+        },
+    ]
+    fake = FakeHA(states)
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+
+    # Scene activation (explicit cue and natural phrasing)
+    out_scene = c.control("activate basement relax")
+    assert out_scene == "Activated Basement Relax."
+    assert fake.posts[0] == (
+        "/api/services/scene/turn_on",
+        {"entity_id": "scene.basement_basement_relax"},
+    )
+
+    out_scene2 = c.control("set living room to dimmed")
+    assert out_scene2 == "Activated Living Room Dimmed."
+    assert fake.posts[1] == (
+        "/api/services/scene/turn_on",
+        {"entity_id": "scene.living_room_living_room_dimmed"},
+    )
+
+    # Explicit brightness percentage
+    out_dim_pct = c.control("dim living room to 30%")
+    assert out_dim_pct == "Living Room set to 30%."
+    assert fake.posts[2] == (
+        "/api/services/light/turn_on",
+        {"entity_id": "light.living_room_living_room", "brightness_pct": 30},
+    )
+
+    # Relative dim from 80% (204/255) -> 50%
+    out_dim_rel = c.control("dim the basement")
+    assert out_dim_rel == "Basement set to 50%."
+    assert fake.posts[3] == (
+        "/api/services/light/turn_on",
+        {"entity_id": "light.basement_basement", "brightness_pct": 50},
+    )
+
+    # Status reports brightness when available
+    out_status = c.control("is the basement light on")
+    assert out_status == "Basement: on at 80%."
+
+    # All lights off
+    out_all_off = c.control("turn off all lights")
+    assert out_all_off == "Turned off all lights."
+    assert fake.posts[4][0] == "/api/services/light/turn_off"
+    assert "light.basement_basement" in fake.posts[4][1]["entity_id"]
+
+
+def test_music_transport_volume_and_now_playing(monkeypatch):
+    c = _client()
+    states = [
+        _mu_state("media_player.home_assistant_voice_test", state="idle", friendly_name="Voice PE"),
+        _mu_state(
+            "media_player.basement_speaker_1_2",
+            state="playing",
+            friendly_name="Basement speaker",
+            media_title="The Summoning",
+            media_artist="Sleep Token",
+            volume_level=0.40,
+        ),
+        _mu_state("media_player.kitchen_display_2", state="idle", friendly_name="Kitchen display", volume_level=0.50),
+    ]
+    fake = FakeHA(states)
+    monkeypatch.setattr(c, "_get_raw", fake.get)
+    monkeypatch.setattr(c, "_post_raw", fake.post)
+
+    # Now playing finds actively playing speaker without room name
+    assert c.music("what's playing") == "Playing The Summoning by Sleep Token on Basement speaker."
+
+    # Roomless skip targets actively playing speaker
+    out_skip = c.music("skip this song")
+    assert fake.posts[0] == (
+        "/api/services/media_player/media_next_track",
+        {"entity_id": "media_player.basement_speaker_1_2"},
+    )
+    assert "The Summoning" in out_skip
+
+    # Volume up uses active speaker (+10% from 40% -> 50%)
+    out_vol_up = c.music("turn it up")
+    assert fake.posts[1] == (
+        "/api/services/media_player/volume_set",
+        {"entity_id": "media_player.basement_speaker_1_2", "volume_level": 0.5},
+    )
+    assert "50%" in out_vol_up
+
+    # Explicit volume in specific room
+    out_vol_set = c.music("set volume to 35 in the kitchen")
+    assert fake.posts[2] == (
+        "/api/services/media_player/volume_set",
+        {"entity_id": "media_player.kitchen_display_2", "volume_level": 0.35},
+    )
+    assert "35%" in out_vol_set
+
+    # Resume and mute
+    out_mute = c.music("mute the kitchen")
+    assert fake.posts[3] == (
+        "/api/services/media_player/volume_mute",
+        {"entity_id": "media_player.kitchen_display_2", "is_volume_muted": True},
+    )
+    assert "Muted" in out_mute
+
+    out_resume = c.music("resume in the kitchen")
+    assert fake.posts[4] == (
+        "/api/services/media_player/media_play",
+        {"entity_id": "media_player.kitchen_display_2"},
+    )
+    assert "Resumed" in out_resume
+
+
+def test_weather_feels_like_gusts_and_hourly(monkeypatch):
+    import datetime
+
+    c = _client()
+    monkeypatch.setattr(
+        c,
+        "_get",
+        lambda path: {
+            "state": "cloudy",
+            "attributes": {
+                "temperature": 41,
+                "temperature_unit": "°F",
+                "precipitation_unit": "in",
+                "wind_speed": 7.5,
+                "wind_speed_unit": "mph",
+            },
+        },
+    )
+
+    now = datetime.datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+    target_5pm = now.replace(hour=17)
+    if target_5pm < now:
+        target_5pm += datetime.timedelta(days=1)
+
+    def fake_post(path, payload):
+        if payload.get("type") == "hourly":
+            return {
+                "service_response": {
+                    "weather.home": {
+                        "forecast": [
+                            {
+                                "datetime": now.isoformat(),
+                                "condition": "cloudy",
+                                "temperature": 41,
+                                "apparent_temperature": 34,
+                                "wind_gust_speed": 15,
+                                "precipitation": 0.0,
+                            },
+                            {
+                                "datetime": target_5pm.isoformat(),
+                                "condition": "rainy",
+                                "temperature": 39,
+                                "apparent_temperature": 31,
+                                "wind_gust_speed": 28,
+                                "precipitation": 0.15,
+                            },
+                        ]
+                    }
+                }
+            }
+        return {
+            "service_response": {
+                "weather.home": {
+                    "forecast": [
+                        {
+                            "datetime": "2026-11-25T00:00:00+00:00",
+                            "condition": "cloudy",
+                            "temperature": 41,
+                            "apparent_temperature": 34,
+                            "templow": 25,
+                            "wind_gust_speed": 18,
+                            "precipitation": 0.0,
+                        },
+                        {
+                            "datetime": "2026-11-26T00:00:00+00:00",
+                            "condition": "pouring",
+                            "temperature": 52,
+                            "templow": 39,
+                            "wind_gust_speed": 50,
+                            "precipitation": 3.97,
+                        },
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(c, "_post", fake_post)
+
+    # Daily includes feels-like (34 vs 41) and gusts (50 mph)
+    daily_out = c.weather("what is the weather")
+    assert "feels like 34°F" in daily_out
+    assert "gusts to 50 mph" in daily_out
+
+    # Specific hour query uses hourly forecast
+    hour_out = c.weather("weather at 5pm")
+    assert "5 PM" in hour_out and "39°F" in hour_out and "0.15 in rain" in hour_out
+
+    # Umbrella / rain query scans hourly window
+    rain_out = c.weather("do I need an umbrella tonight")
+    assert "rainy starting around" in rain_out and "gusts to 28 mph" in rain_out

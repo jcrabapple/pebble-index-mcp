@@ -30,11 +30,20 @@ _TIMEOUT = 10.0
 _FILLER = frozenset(
     """turn switch please the a an my to in at now can you could would hey set
     make get shut kill is are do does what s it them on off open close
-    toggle up down""".split()
+    toggle up down scene activate put mode""".split()
 )
 
 _ACTION_RE = re.compile(r"\b(on|off|toggle|open|close)\b")
 _STATUS_RE = re.compile(r"\b(status|state)\b")
+_BRIGHTNESS_PCT_RE = re.compile(
+    r"\b(?:to\s+|at\s+)?(\d{1,3})\s*(?:%|percent)\b"
+    r"|\b(?:dim|brighten|brightness|level)\b.*?\b(\d{1,3})\b"
+    r"|\bset\b.*?\bto\s+(\d{1,3})\b"
+)
+_DIM_WORD_RE = re.compile(r"\b(dim|dimmer|darker)\b")
+_BRIGHTEN_WORD_RE = re.compile(r"\b(brighten|brighter)\b")
+_SCENE_CUE_RE = re.compile(r"\b(scene|activate)\b")
+_ALL_LIGHTS_RE = re.compile(r"\ball\s+(?:the\s+)?lights?\b")
 
 _DEFAULT_MUSIC_ROOMS: list[tuple[str, str]] = []
 _COMPOUND_GROCERY_ITEMS = (
@@ -194,19 +203,26 @@ class HAClient:
 
     # -- resolution (pure; tests pass states directly) ----------------------
 
-    def resolve(self, states: list[dict], tokens: list[str]) -> dict:
+    def resolve(
+        self,
+        states: list[dict],
+        tokens: list[str],
+        *,
+        domains: tuple[str, ...] = _ALLOWED_DOMAINS,
+    ) -> dict:
         """Pick the best entity for the target tokens.
 
         Ranking: full token matches first, then available over
-        unavailable/unknown, then group entities over their members, then
-        raw match count. Ties among distinct entities at the top are
-        ambiguous and raise with the candidates listed.
+        unavailable/unknown (skipped for scenes whose idle state is unknown),
+        then group entities over their members, then raw match count. Ties
+        among distinct entities at the top are ambiguous and raise with the
+        candidates listed.
         """
         tokens = [t for t in tokens if t]
         if not tokens:
             raise HAError("No device named in the command.")
         cands = [
-            s for s in states if s["entity_id"].split(".", 1)[0] in _ALLOWED_DOMAINS
+            s for s in states if s["entity_id"].split(".", 1)[0] in domains
         ]
         if not cands:
             raise HAError("No controllable devices found in Home Assistant.")
@@ -218,17 +234,19 @@ class HAClient:
 
         scored = []
         for s in cands:
+            eid = s["entity_id"]
             text = _text_tokens(
-                s["entity_id"], s["attributes"].get("friendly_name", "")
+                eid, s["attributes"].get("friendly_name", "")
             )
             match = sum(1 for t in tokens if t in text)
+            avail = True if eid.startswith("scene.") else (s["state"] not in _BAD_STATES)
             scored.append(
                 {
                     "entity": s,
                     "match": match,
                     "full": tokens and match == len(tokens),
-                    "available": s["state"] not in _BAD_STATES,
-                    "group": is_group(s["entity_id"]),
+                    "available": avail,
+                    "group": is_group(eid),
                 }
             )
 
@@ -268,12 +286,118 @@ class HAClient:
 
     # -- high level ----------------------------------------------------------
 
+    def _control_all_lights(self, states: list[dict], action: str) -> str:
+        lights = [
+            s for s in states
+            if s["entity_id"].startswith("light.") and s["state"] not in _BAD_STATES
+        ]
+        if action in ("off", "close"):
+            targets = [s["entity_id"] for s in lights if s["state"] == "on"]
+            if not targets:
+                return "All lights are already off."
+            self._post("/api/services/light/turn_off", {"entity_id": targets})
+            return "Turned off all lights."
+        if action in ("on", "open"):
+            # Prefer room groups + standalone lights to avoid double-toggling fixtures
+            ids = {s["entity_id"] for s in lights}
+            groups = {eid for eid in ids if any(o != eid and o.startswith(eid + "_") for o in ids)}
+            targets = [
+                s["entity_id"] for s in lights
+                if s["state"] == "off"
+                and (s["entity_id"] in groups or not any(s["entity_id"].startswith(g + "_") for g in groups))
+            ]
+            if not targets:
+                return "All lights are already on."
+            self._post("/api/services/light/turn_on", {"entity_id": targets})
+            return "Turned on all lights."
+        raise HAError('Say "all lights off" or "all lights on".')
+
+    def _control_brightness(self, states: list[dict], raw: str, pct: int | None, delta: int = 0) -> str:
+        # Remove brightness numbers and action words before resolving the light target
+        cleaned = re.sub(r"[^a-z0-9 ]+", " ", raw.lower())
+        cleaned = re.sub(r"\b\d{1,3}\s*(?:percent)?\b", " ", cleaned)
+        cleaned = re.sub(r"\b(?:dim|dimmer|darker|brighten|brighter|brightness|level)\b", " ", cleaned)
+        tokens = _target_tokens(cleaned)
+        entity = self.resolve(states, tokens, domains=("light",))
+        eid = entity["entity_id"]
+        friendly = entity["attributes"].get("friendly_name", eid)
+
+        if pct is None:
+            cur_b = (entity.get("attributes") or {}).get("brightness")
+            if isinstance(cur_b, (int, float)) and entity.get("state") == "on":
+                cur_pct = round(cur_b * 100 / 255)
+                pct = max(10, min(100, cur_pct + delta))
+            else:
+                pct = 30 if delta < 0 else 100
+        pct = max(0, min(100, pct))
+        if pct == 0:
+            self._post("/api/services/light/turn_off", {"entity_id": eid})
+            return f"{friendly} is now off."
+        self._post("/api/services/light/turn_on", {"entity_id": eid, "brightness_pct": pct})
+        return f"{friendly} set to {pct}%."
+
+    def _control_scene(self, states: list[dict], raw: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9 ]+", " ", raw.lower())
+        tokens = _target_tokens(cleaned)
+        entity = self.resolve(states, tokens, domains=("scene",))
+        eid = entity["entity_id"]
+        friendly = entity["attributes"].get("friendly_name", eid)
+        self._post("/api/services/scene/turn_on", {"entity_id": eid})
+        return f"Activated {friendly}."
+
     def control(self, command: str) -> str:
-        """Run one smart-home command and return a short spoken result."""
+        """Run one smart-home command (on/off/toggle/open/close/dim/scenes/all-lights)."""
         if not self.token:
             raise HAError("Smart home control unavailable: HASS_TOKEN not configured.")
+        raw = command.strip()
+        if not raw:
+            raise HAError("Empty command.")
+        low = raw.lower()
         states = self._get("/api/states")
-        action, tokens = parse_command(command)
+
+        # 1. All lights off / on
+        if _ALL_LIGHTS_RE.search(low) and not _STATUS_RE.search(low):
+            matches = list(_ACTION_RE.finditer(re.sub(r"[^a-z0-9 ]+", " ", low)))
+            if matches:
+                return self._control_all_lights(states, matches[-1].group(1))
+
+        # 2. Explicit brightness percentage ("dim living room to 30%", "set living room to 50%")
+        m_pct = _BRIGHTNESS_PCT_RE.search(low)
+        if m_pct and not _STATUS_RE.search(low):
+            pct_str = m_pct.group(1) or m_pct.group(2) or m_pct.group(3)
+            return self._control_brightness(states, raw, int(pct_str))
+
+        # 3. Relative dim / brighten ("dim the living room", "brighten the office")
+        if not _STATUS_RE.search(low) and not _SCENE_CUE_RE.search(low):
+            if _DIM_WORD_RE.search(low) and not _ACTION_RE.search(re.sub(r"[^a-z0-9 ]+", " ", low)):
+                return self._control_brightness(states, raw, None, delta=-30)
+            if _BRIGHTEN_WORD_RE.search(low) and not _ACTION_RE.search(re.sub(r"[^a-z0-9 ]+", " ", low)):
+                return self._control_brightness(states, raw, None, delta=30)
+
+        # 4. Explicit scene cue ("activate basement relax", "living room dimmed scene")
+        if _SCENE_CUE_RE.search(low):
+            return self._control_scene(states, raw)
+
+        # 5. "set <room> to <scene>" / "put <room> on <scene>" when no standard action wins
+        #    or standard on/off/toggle/open/close/status fails -> try matching a scene!
+        try:
+            action, tokens = parse_command(raw)
+        except HAError as parse_err:
+            if any(s["entity_id"].startswith("scene.") for s in states):
+                try:
+                    return self._control_scene(states, raw)
+                except HAError:
+                    pass
+            raise parse_err
+
+        # If "put basement on relax" matched `on` in the middle, check if a scene matches better
+        if action == "on" and re.search(r"\b(?:set|put)\b.+\b(?:to|on)\s+[a-z]", low):
+            if any(s["entity_id"].startswith("scene.") for s in states):
+                try:
+                    return self._control_scene(states, raw)
+                except HAError:
+                    pass
+
         entity = self.resolve(states, tokens)
         eid = entity["entity_id"]
         domain = eid.split(".", 1)[0]
@@ -281,6 +405,10 @@ class HAClient:
         pre_state = entity["state"]
 
         if action == "status":
+            if domain == "light" and pre_state == "on":
+                b = (entity.get("attributes") or {}).get("brightness")
+                if isinstance(b, (int, float)):
+                    return f"{friendly}: on at {round(b * 100 / 255)}%."
             return f"{friendly}: {pre_state}."
 
         if domain == "cover":
@@ -459,37 +587,73 @@ class HAClient:
                 return eid, label.lower()
         raise HAError("No available speaker found right now.")
 
-    def _resolve_player(self, cleaned: str, states: list[dict]) -> tuple[str, str, str]:
-        """Return (entity_id, room_key, media_text) for a music command."""
+    def _resolve_player(
+        self,
+        cleaned: str,
+        states: list[dict],
+        *,
+        prefer_active: bool = False,
+        accept_paused: bool = False,
+    ) -> tuple[str, str, str, bool]:
+        """Return (entity_id, room_key, media_text, explicit_room) for a music command."""
         rooms = self._effective_music_rooms(states)
         room_key = None
         entity = None
+        explicit_room = False
         media = cleaned
-        m = re.search(r"\b(?:on|in|to)\s+(?:the\s+)?([a-z0-9 ]+)$", cleaned)
-        if m:
-            phrase = m.group(1).strip()
-            for key, eid in rooms:  # longest keys first
-                if key in phrase or phrase == key:
-                    room_key = key
-                    entity = eid
-                    media = (cleaned[: m.start()] + " " + cleaned[m.end():])
+        # Check room prepositions from the LAST one backward so phrases like
+        # "set volume to 35 in the kitchen" match "kitchen" without eating "to 35".
+        prep_matches = list(re.finditer(r"\b(?:on|in|to)\s+(?:the\s+)?", cleaned))
+        if prep_matches:
+            matched_prep = False
+            for pm in reversed(prep_matches):
+                phrase = cleaned[pm.end():].strip()
+                for key, eid in rooms:  # longest keys first
+                    if key in phrase or phrase == key:
+                        room_key = key
+                        entity = eid
+                        explicit_room = True
+                        media = cleaned[: pm.start()]
+                        matched_prep = True
+                        break
+                if matched_prep:
                     break
-            else:
-                if phrase not in self._GENERIC_PLACES:
+            if not matched_prep:
+                tail_phrase = cleaned[prep_matches[-1].end():].strip()
+                if tail_phrase not in self._GENERIC_PLACES and not re.match(r"^\d+(?:\s*percent)?$", tail_phrase):
                     names = ", ".join(k for k, _ in rooms[:10])
                     raise HAError(
-                        f"Unknown room '{phrase}'. Known rooms: {names}."
+                        f"Unknown room '{tail_phrase}'. Known rooms: {names}."
                     )
         if room_key is None:
             for key, eid in rooms:
                 if f" {key} " in f" {cleaned} " and key != "voice pe":
                     room_key = key
                     entity = eid
+                    explicit_room = True
                     media = cleaned.replace(key, " ")
                     break
+        if entity is None and prefer_active:
+            active_states = ("playing", "paused") if accept_paused else ("playing",)
+            active = [
+                s for s in states
+                if s.get("entity_id", "").startswith("media_player.")
+                and s.get("state") in active_states
+            ]
+            active.sort(
+                key=lambda s: (
+                    s.get("state") == "playing",
+                    s["entity_id"].endswith("_2"),
+                ),
+                reverse=True,
+            )
+            if active:
+                st = active[0]
+                entity = st["entity_id"]
+                room_key = ((st.get("attributes") or {}).get("friendly_name") or entity.split(".", 1)[1]).lower()
         if entity is None:
             entity, room_key = self._pick_default_player(states)
-        return entity, room_key or "speaker", media.strip()
+        return entity, room_key or "speaker", re.sub(r"\s+", " ", media).strip(), explicit_room
 
     @staticmethod
     def _media_parts(media: str) -> tuple[str, str]:
@@ -503,8 +667,22 @@ class HAClient:
                 return ctype, m.group(1).strip()
         return "artist", media
 
+    @staticmethod
+    def _format_now_playing(state: dict, fallback_room: str) -> str:
+        attrs = state.get("attributes") or {}
+        title = attrs.get("media_title")
+        artist = attrs.get("media_artist") or ""
+        room = attrs.get("friendly_name") or fallback_room
+        if state.get("state") == "playing" and title:
+            by = f" by {artist}" if artist else ""
+            return f"Playing {title}{by} on {room}."
+        if state.get("state") == "paused" and title:
+            by = f" by {artist}" if artist else ""
+            return f"Paused on {title}{by} ({room})."
+        return f"Nothing is playing on {room}."
+
     def music(self, command: str) -> str:
-        """Play/stop Deezer music (via Music Assistant) on a room speaker."""
+        """Play, transport-control, volume-adjust, or query music via Music Assistant."""
         if not self.token:
             raise HAError("Music control unavailable: HASS_TOKEN not configured.")
         cleaned = self._clean_command(command)
@@ -512,7 +690,36 @@ class HAClient:
             raise HAError("Empty command.")
 
         states = self._get("/api/states")
-        entity, room_key, media = self._resolve_player(cleaned, states)
+
+        # Now-playing queries
+        if re.search(r"\b(?:whats|what is)\s+(?:currently\s+)?playing\b|\bnow\s+playing\b|\bwhat\s+(?:song|track)\s+is\s+(?:this|playing)\b", cleaned):
+            entity, room_key, _, explicit_room = self._resolve_player(
+                cleaned, states, prefer_active=True, accept_paused=True
+            )
+            if not explicit_room:
+                playing = [
+                    s for s in states
+                    if s.get("entity_id", "").startswith("media_player.")
+                    and s.get("state") == "playing"
+                    and (s.get("attributes") or {}).get("media_title")
+                ]
+                playing.sort(key=lambda s: s["entity_id"].endswith("_2"), reverse=True)
+                if playing:
+                    return self._format_now_playing(playing[0], room_key)
+                return "Nothing is playing right now."
+            st = next((s for s in states if s["entity_id"] == entity), None)
+            if st is None or st["state"] in _BAD_STATES:
+                raise HAError(f"The {room_key} speaker is not available right now.")
+            return self._format_now_playing(st, room_key)
+
+        is_transport = bool(
+            re.match(r"^(?:stop|pause|resume|unpause|continue|next|skip|previous|prev|back|mute|unmute|volume|louder|quieter|turn\s+(?:it\s+|the\s+volume\s+)?(?:up|down))\b", cleaned)
+            or re.search(r"\b(?:volume\s+(?:up|down|to|\d+)|set\s+.*\bvolume\b)", cleaned)
+        )
+        accept_paused = bool(re.match(r"^(?:resume|unpause|continue)\b", cleaned))
+        entity, room_key, media, _ = self._resolve_player(
+            cleaned, states, prefer_active=is_transport, accept_paused=accept_paused
+        )
         state = next(
             (s for s in states if s["entity_id"] == entity), None
         )
@@ -523,6 +730,67 @@ class HAClient:
             service = "media_pause" if media.startswith("pause") else "media_stop"
             self._post(f"/api/services/media_player/{service}", {"entity_id": entity})
             return "Paused." if service == "media_pause" else "Stopped."
+
+        if re.match(r"^(?:resume|unpause|continue)\b", media):
+            self._post("/api/services/media_player/media_play", {"entity_id": entity})
+            return f"Resumed on the {room_key}."
+
+        if re.match(r"^(?:next|skip)\b", media):
+            self._post("/api/services/media_player/media_next_track", {"entity_id": entity})
+            time.sleep(0.25)
+            updated = self._get(f"/api/states/{entity}")
+            attrs = updated.get("attributes", {}) if isinstance(updated, dict) else {}
+            title = attrs.get("media_title")
+            if title:
+                artist = attrs.get("media_artist") or ""
+                by = f" by {artist}" if artist else ""
+                return f"Skipped to {title}{by}."
+            return "Skipped track."
+
+        if re.match(r"^(?:previous|prev|back)\b", media):
+            self._post("/api/services/media_player/media_previous_track", {"entity_id": entity})
+            return "Previous track."
+
+        if re.match(r"^(?:unmute|mute)\b", media):
+            muted = media.startswith("mute")
+            self._post(
+                "/api/services/media_player/volume_mute",
+                {"entity_id": entity, "is_volume_muted": muted},
+            )
+            return f"Muted the {room_key}." if muted else f"Unmuted the {room_key}."
+
+        m_vol_pct = re.search(r"\bvolume\b.*?\b(\d{1,3})\b|\bset\b.*?\bvolume\s+(?:to\s+)?(\d{1,3})\b", media)
+        if m_vol_pct:
+            pct = max(0, min(100, int(m_vol_pct.group(1) or m_vol_pct.group(2))))
+            self._post(
+                "/api/services/media_player/volume_set",
+                {"entity_id": entity, "volume_level": round(pct / 100.0, 2)},
+            )
+            return f"Volume set to {pct}% on the {room_key}."
+
+        if re.search(r"\b(?:volume\s+up|turn\s+(?:it\s+|the\s+volume\s+)?up|louder)\b", media):
+            cur = (state.get("attributes") or {}).get("volume_level")
+            if isinstance(cur, (int, float)):
+                new_level = round(min(1.0, float(cur) + 0.10), 2)
+                self._post(
+                    "/api/services/media_player/volume_set",
+                    {"entity_id": entity, "volume_level": new_level},
+                )
+                return f"Volume up to {round(new_level * 100)}% on the {room_key}."
+            self._post("/api/services/media_player/volume_up", {"entity_id": entity})
+            return f"Volume up on the {room_key}."
+
+        if re.search(r"\b(?:volume\s+down|turn\s+(?:it\s+|the\s+volume\s+)?down|quieter|softer)\b", media):
+            cur = (state.get("attributes") or {}).get("volume_level")
+            if isinstance(cur, (int, float)):
+                new_level = round(max(0.0, float(cur) - 0.10), 2)
+                self._post(
+                    "/api/services/media_player/volume_set",
+                    {"entity_id": entity, "volume_level": new_level},
+                )
+                return f"Volume down to {round(new_level * 100)}% on the {room_key}."
+            self._post("/api/services/media_player/volume_down", {"entity_id": entity})
+            return f"Volume down on the {room_key}."
 
         media = re.sub(r"^(?:play|put on|start|queue)\s+(?:some\s+)?", "", media).strip()
         if not media:
@@ -695,10 +963,21 @@ class HAClient:
         "sunday",
     )
 
+    _HOURLY_QUERY_RE = re.compile(
+        r"\b(tonight|evening|afternoon|morning|hourly|next\s+few\s+hours|umbrella|"
+        r"rain\s+today|will\s+it\s+rain|going\s+to\s+rain|snow\s+today)\b"
+        r"|\b(?:at|around|by)\s+(\d{1,2})\s*(am|pm)\b"
+    )
+    _WET_CONDITIONS = frozenset({"rainy", "pouring", "lightning-rainy", "snowy", "snowy-rainy", "hail"})
+
     @staticmethod
     def _format_local_time(iso_str: str) -> str:
         dt = datetime.datetime.fromisoformat(iso_str).astimezone()
         return dt.strftime("%-I:%M %p")
+
+    @staticmethod
+    def _format_local_hour(dt: datetime.datetime) -> str:
+        return dt.strftime("%-I %p")
 
     @staticmethod
     def _format_forecast_day(
@@ -706,11 +985,13 @@ class HAClient:
         entry: dict,
         temp_unit: str = "°F",
         precip_unit: str = "in",
+        wind_unit: str = "mph",
     ) -> str:
         cond = str(entry.get("condition", "unknown")).replace("-", " ")
         high = entry.get("temperature")
         low = entry.get("templow")
         precip = entry.get("precipitation") or 0.0
+        gust = entry.get("wind_gust_speed")
         parts = [f"{label}: {cond}"]
         if high is not None and low is not None:
             parts.append(f"high {round(high)}{temp_unit}, low {round(low)}{temp_unit}")
@@ -718,10 +999,112 @@ class HAClient:
             parts.append(f"{round(high)}{temp_unit}")
         if precip and float(precip) > 0:
             parts.append(f"{precip} {precip_unit} rain")
+        if gust is not None and float(gust) >= 20:
+            parts.append(f"gusts to {round(float(gust))} {wind_unit}")
         return ", ".join(parts)
 
+    def _fetch_forecast(self, forecast_type: str) -> list[dict]:
+        try:
+            fc_resp = self._post(
+                "/api/services/weather/get_forecasts?return_response",
+                {"entity_id": "weather.home", "type": forecast_type},
+            )
+            svc = (fc_resp.get("service_response") or fc_resp) if isinstance(fc_resp, dict) else {}
+            return (svc.get("weather.home") or {}).get("forecast") or []
+        except HAError:
+            return []
+
+    def _format_hourly_answer(
+        self,
+        q: str,
+        cur_sentence: str,
+        hourly: list[dict],
+        temp_unit: str,
+        precip_unit: str,
+        wind_unit: str,
+    ) -> str:
+        parsed: list[tuple[datetime.datetime, dict]] = []
+        for entry in hourly:
+            dt_raw = entry.get("datetime")
+            if not dt_raw:
+                continue
+            try:
+                dt = datetime.datetime.fromisoformat(dt_raw).astimezone()
+            except ValueError:
+                continue
+            parsed.append((dt, entry))
+        if not parsed:
+            return cur_sentence
+
+        # Specific clock hour ("at 5pm", "around 8 am")
+        m_hr = re.search(r"\b(?:at|around|by)\s+(\d{1,2})\s*(am|pm)\b", q)
+        if m_hr:
+            hr = int(m_hr.group(1)) % 12 + (12 if m_hr.group(2) == "pm" else 0)
+            match = next(((dt, e) for dt, e in parsed[:24] if dt.hour == hr), None)
+            if match:
+                dt, e = match
+                cond = str(e.get("condition", "unknown")).replace("-", " ")
+                t = e.get("temperature")
+                feels = e.get("apparent_temperature")
+                precip = e.get("precipitation") or 0.0
+                bits = [f"Around {self._format_local_hour(dt)}: {round(t)}{temp_unit} and {cond}" if t is not None else f"Around {self._format_local_hour(dt)}: {cond}"]
+                if t is not None and feels is not None and abs(float(feels) - float(t)) >= 4:
+                    bits.append(f"feels like {round(float(feels))}{temp_unit}")
+                if precip and float(precip) > 0:
+                    bits.append(f"{precip} {precip_unit} rain")
+                return f"{cur_sentence} " + ", ".join(bits) + "."
+
+        # Choose slice window
+        window = parsed[:12]
+        window_label = "next 12 hours"
+        if "tonight" in q or "evening" in q:
+            evening = [(dt, e) for dt, e in parsed[:18] if dt.hour >= 17 or dt.hour <= 3]
+            if evening:
+                window = evening[:10]
+                window_label = "Tonight"
+        elif "afternoon" in q:
+            aft = [(dt, e) for dt, e in parsed[:18] if 12 <= dt.hour <= 17]
+            if aft:
+                window = aft
+                window_label = "This afternoon"
+        elif "morning" in q:
+            morn = [(dt, e) for dt, e in parsed[:24] if 6 <= dt.hour <= 11]
+            if morn:
+                window = morn[:6]
+                window_label = "This morning"
+
+        wet = [
+            (dt, e) for dt, e in window
+            if (e.get("precipitation") or 0.0) > 0 or str(e.get("condition", "")) in self._WET_CONDITIONS
+        ]
+        temps = [float(e["temperature"]) for _, e in window if e.get("temperature") is not None]
+        max_gust = max((float(e.get("wind_gust_speed") or 0.0) for _, e in window), default=0.0)
+
+        if any(k in q for k in ("rain", "umbrella", "snow")):
+            if not wet:
+                return f"{cur_sentence} No rain expected for {window_label.lower()}."
+            first_dt, first_e = wet[0]
+            cond = str(first_e.get("condition", "rain")).replace("-", " ")
+            total_precip = round(sum(float(e.get("precipitation") or 0.0) for _, e in wet), 2)
+            extra = f" (~{total_precip} {precip_unit} total)" if total_precip > 0 else ""
+            gust_str = f", gusts to {round(max_gust)} {wind_unit}" if max_gust >= 20 else ""
+            return (
+                f"{cur_sentence} {window_label}: {cond} starting around "
+                f"{self._format_local_hour(first_dt)}{extra}{gust_str}."
+            )
+
+        cond0 = str(window[0][1].get("condition", "unknown")).replace("-", " ")
+        bits = [f"{window_label}: {cond0}"]
+        if temps:
+            bits.append(f"{round(min(temps))} to {round(max(temps))}{temp_unit}")
+        if wet:
+            bits.append(f"rain around {self._format_local_hour(wet[0][0])}")
+        if max_gust >= 20:
+            bits.append(f"gusts to {round(max_gust)} {wind_unit}")
+        return f"{cur_sentence} " + ", ".join(bits) + "."
+
     def weather(self, query: str = "") -> str:
-        """Return local weather conditions, forecast, or sunrise/sunset from HA."""
+        """Return local weather conditions, hourly/daily forecast, or sunrise/sunset from HA."""
         if not self.token:
             raise HAError("Weather unavailable: HASS_TOKEN not configured.")
         q = query.lower().strip()
@@ -743,24 +1126,39 @@ class HAClient:
         precip_unit = attrs.get("precipitation_unit", "in")
         wind = attrs.get("wind_speed")
         wind_unit = attrs.get("wind_speed_unit", "mph")
+        feels_like = attrs.get("apparent_temperature")
 
         cur_bits = [f"Currently {round(temp)}{unit} and {cond}" if temp is not None else f"Currently {cond}"]
+        if temp is not None and feels_like is not None and abs(float(feels_like) - float(temp)) >= 4:
+            cur_bits.append(f"feels like {round(float(feels_like))}{unit}")
         if wind is not None and float(wind) >= 10:
             cur_bits.append(f"wind {round(float(wind))} {wind_unit}")
         cur_sentence = ", ".join(cur_bits) + "."
 
-        try:
-            fc_resp = self._post(
-                "/api/services/weather/get_forecasts?return_response",
-                {"entity_id": "weather.home", "type": "daily"},
-            )
-            svc = (fc_resp.get("service_response") or fc_resp) if isinstance(fc_resp, dict) else {}
-            forecast = (svc.get("weather.home") or {}).get("forecast") or []
-        except HAError:
-            forecast = []
+        # Check if query asks about a specific future weekday or tomorrow (stay daily)
+        asks_future_day = "tomorrow" in q or any(d in q for d in self._WEEKDAYS)
 
+        if not asks_future_day and self._HOURLY_QUERY_RE.search(q):
+            hourly = self._fetch_forecast("hourly")
+            if hourly:
+                # Enrich feels-like from hourly[0] if current state lacked it
+                if feels_like is None and temp is not None:
+                    h_feels = hourly[0].get("apparent_temperature")
+                    if h_feels is not None and abs(float(h_feels) - float(temp)) >= 4:
+                        cur_bits.insert(1, f"feels like {round(float(h_feels))}{unit}")
+                        cur_sentence = ", ".join(cur_bits) + "."
+                return self._format_hourly_answer(q, cur_sentence, hourly, unit, precip_unit, wind_unit)
+
+        forecast = self._fetch_forecast("daily")
         if not forecast:
             return cur_sentence
+
+        # Enrich current sentence with feels-like from today's forecast when notable
+        if feels_like is None and temp is not None:
+            d_feels = forecast[0].get("apparent_temperature")
+            if d_feels is not None and abs(float(d_feels) - float(temp)) >= 4:
+                cur_bits.insert(1, f"feels like {round(float(d_feels))}{unit}")
+                cur_sentence = ", ".join(cur_bits) + "."
 
         # Check if user asked about a specific weekday or tomorrow
         for idx, entry in enumerate(forecast):
@@ -772,14 +1170,14 @@ class HAClient:
             except ValueError:
                 continue
             if day_name in q and idx > 0:
-                return f"{cur_sentence} {self._format_forecast_day(day_name.capitalize(), entry, unit, precip_unit)}."
+                return f"{cur_sentence} {self._format_forecast_day(day_name.capitalize(), entry, unit, precip_unit, wind_unit)}."
 
         if "tomorrow" in q and len(forecast) > 1:
-            return f"{cur_sentence} {self._format_forecast_day('Tomorrow', forecast[1], unit, precip_unit)}."
+            return f"{cur_sentence} {self._format_forecast_day('Tomorrow', forecast[1], unit, precip_unit, wind_unit)}."
 
-        segments = [cur_sentence, self._format_forecast_day("Today", forecast[0], unit, precip_unit) + "."]
+        segments = [cur_sentence, self._format_forecast_day("Today", forecast[0], unit, precip_unit, wind_unit) + "."]
         if len(forecast) > 1:
-            segments.append(self._format_forecast_day("Tomorrow", forecast[1], unit, precip_unit) + ".")
+            segments.append(self._format_forecast_day("Tomorrow", forecast[1], unit, precip_unit, wind_unit) + ".")
         return " ".join(segments)
 
 
