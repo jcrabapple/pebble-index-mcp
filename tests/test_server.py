@@ -240,6 +240,11 @@ def test_web_search_prefers_trivet_and_falls_back_to_exa(monkeypatch):
     assert r2.structuredContent["semanticResult"]["text"] == "Exa backup answered."
     assert "Exa Hit" in r2.structuredContent["output"]
 
+    # compose=False skips LLM composition (for agent MCP clients like voice)
+    r_raw = srv.web_search("test query", compose=False)
+    assert r_raw.meta is None
+    assert "Exa Hit" in r_raw.content[0].text
+
 
 def test_ask_hermes_returns_core_schema_response(monkeypatch):
     srv = _reload(monkeypatch, VAULT_PATH="")
@@ -278,7 +283,7 @@ def test_hermes_task_without_agent_configuration(monkeypatch):
 def test_smart_home_announce_error_returns_original_message(monkeypatch):
     srv = _reload(monkeypatch, VAULT_PATH="")
 
-    def fail(message):
+    def fail(message, target=""):
         raise srv.HAError("No available speaker")
 
     monkeypatch.setattr(srv.HA, "announce", fail)
@@ -288,6 +293,22 @@ def test_smart_home_announce_error_returns_original_message(monkeypatch):
         "text": "No available speaker",
         "question": "dinner is ready",
     }
+
+
+def test_smart_home_routine_and_ma_music(monkeypatch):
+    srv = _reload(
+        monkeypatch,
+        VAULT_PATH="",
+        MASS_SERVER_URL="http://ma.test:8095",
+        MASS_ACCESS_TOKEN="ma-tok",
+    )
+    monkeypatch.setattr(srv.HA, "routine", lambda mode, calendar_fn=None: f"Ran {mode}.")
+    r_rt = srv.smart_home("routine", "morning")
+    assert r_rt.structuredContent["semanticResult"]["text"] == "Ran morning."
+
+    monkeypatch.setattr(srv.MA, "command", lambda cmd: f"MA handled: {cmd}")
+    r_mu = srv.ha_music("what's playing")
+    assert r_mu.structuredContent["semanticResult"]["text"] == "MA handled: what's playing"
 
 
 def test_respond_returns_core_schema_without_llm(monkeypatch):

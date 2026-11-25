@@ -13,12 +13,20 @@ all deterministic, so the ring round-trip stays around a second.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
+import logging
 import re
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
+
+from .home_config import HomeConfig, HomeConfigLoader, norm_key
+
+logger = logging.getLogger("pebble_index_mcp")
 
 _ALLOWED_DOMAINS = ("light", "switch", "fan", "cover", "media_player")
 _BAD_STATES = {"unavailable", "unknown"}
@@ -132,10 +140,14 @@ class HAClient:
         timeout: float = _TIMEOUT,
         music_rooms: list[tuple[str, str]] | dict[str, str] | None = None,
         default_players: list[str] | str | None = None,
+        home_config: HomeConfigLoader | HomeConfig | None = None,
+        sync_announce: bool = False,
     ):
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self._home_config = home_config
+        self._sync_announce = sync_announce
         if isinstance(music_rooms, dict):
             rooms = [
                 (self._clean_command(k), v.strip())
@@ -459,33 +471,240 @@ class HAClient:
             return f"{friendly} is {pre_state}."
         return f"{friendly} did not respond (state: {pre_state})."
 
-    def announce(self, message: str) -> str:
-        """Speak a message on every live assist_satellite (Voice PE).
+    def _cfg(self) -> HomeConfig:
+        if self._home_config is None:
+            return HomeConfig()
+        if isinstance(self._home_config, HomeConfig):
+            return self._home_config
+        return self._home_config.get()
 
-        HA returns 200 for announce even when the device is offline, so the
-        live-entity precheck IS the verification; there is no state readback
-        for an announcement.
+    _EVERYONE_WORDS = frozenset({"everyone", "everybody", "all", "house", "whole house", "all rooms", "the house"})
+
+    def _resolve_intercom_targets(self, target: str, cfg: HomeConfig) -> tuple[list[tuple[str, str]], str | None]:
+        """Return ([(room_name, ha_entity), ...], bad_token_or_None)."""
+        rooms_out: list[tuple[str, str]] = []
+        seen_entities: set[str] = set()
+        for part in re.split(r",|\band\b", target, flags=re.IGNORECASE):
+            t = norm_key(re.sub(r"^(?:the|in\s+the|to\s+the)\s+", "", part.strip(), flags=re.IGNORECASE))
+            if not t:
+                continue
+            if t in self._EVERYONE_WORDS:
+                for spec in cfg.everyone_rooms():
+                    if spec.ha_entity not in seen_entities:
+                        seen_entities.add(spec.ha_entity)
+                        rooms_out.append((spec.name, spec.ha_entity))
+                continue
+            rname = cfg.resolve_room_name(t)
+            if not rname or not cfg.rooms[rname].ha_entity:
+                return [], part.strip()
+            ent = cfg.rooms[rname].ha_entity
+            if ent not in seen_entities:
+                seen_entities.add(ent)
+                rooms_out.append((rname, ent))
+        return rooms_out, None
+
+    def _split_intercom_message(self, message: str, target: str, cfg: HomeConfig) -> tuple[str, str]:
+        """Extract (target_str, clean_message) from optional target + spoken text."""
+        msg = message.strip()
+        if target.strip():
+            return target.strip(), msg
+        # Handle "tell Sydney dinner is ready" / "announce to the basement ..."
+        m = re.match(
+            r"^(?:tell|announce(?:\s+to)?|intercom(?:\s+to)?)\s+(?:the\s+)?(.+)$",
+            msg,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            rest = m.group(1).strip()
+            # Check "everyone ..." first
+            for ew in sorted(self._EVERYONE_WORDS, key=len, reverse=True):
+                m_ew = re.match(rf"^{re.escape(ew)}\b[\s,:-]*(.+)$", rest, flags=re.IGNORECASE)
+                if m_ew:
+                    return ew, m_ew.group(1).strip()
+            # Check configured room/person aliases longest-first
+            for key, rname in cfg.all_room_keys_longest_first():
+                m_rk = re.match(rf"^{re.escape(key)}\b[\s,:-]*(.+)$", rest, flags=re.IGNORECASE)
+                if m_rk:
+                    return rname, m_rk.group(1).strip()
+                # Also match apostrophe form like "Sydney's room ..."
+                m_ap = re.match(rf"^{re.escape(rname)}\b[\s,:-]*(.+)$", rest, flags=re.IGNORECASE)
+                if m_ap:
+                    return rname, m_ap.group(1).strip()
+        return "everyone", msg
+
+    def announce(self, message: str, target: str = "") -> str:
+        """Speak an intercom message via MA room speakers (preferred) or assist_satellite.
+
+        When HomeConfig defines rooms + intercom_tts_entity, targets specific
+        rooms/people (or 'everyone', skipping excluded rooms) via tts.speak on
+        live Music Assistant speakers in the background so the turn returns
+        immediately. Falls back to assist_satellite.announce when unconfigured.
         """
         if not self.token:
             raise HAError("Announcements unavailable: HASS_TOKEN not configured.")
-        message = message.strip()
-        if not message:
+        if not message.strip():
             raise HAError("Empty message.")
+
+        cfg = self._cfg()
         states = self._get("/api/states")
-        live = [
+
+        if cfg.rooms and cfg.intercom_tts_entity:
+            tgt, clean_msg = self._split_intercom_message(message, target, cfg)
+            if not clean_msg:
+                raise HAError("Empty message.")
+            resolved, bad = self._resolve_intercom_targets(tgt, cfg)
+            if bad:
+                known = ", ".join(list(cfg.rooms.keys())[:8])
+                raise HAError(f"Unknown intercom target '{bad}'. Rooms: {known}, or everyone.")
+            if resolved:
+                state_map = {s["entity_id"]: s["state"] for s in states}
+                live = [(rn, eid) for rn, eid in resolved if state_map.get(eid, "unavailable") not in _BAD_STATES]
+                dead = [rn for rn, eid in resolved if (rn, eid) not in live]
+                if not live:
+                    raise HAError(f"Intercom target offline: {', '.join(dead)}.")
+                payload: dict[str, Any] = {
+                    "entity_id": cfg.intercom_tts_entity,
+                    "media_player_entity_id": [eid for _, eid in live],
+                    "message": clean_msg,
+                }
+                if cfg.intercom_voice:
+                    payload["options"] = {"voice": cfg.intercom_voice}
+
+                def _fire() -> None:
+                    try:
+                        self._post("/api/services/tts/speak", payload)
+                    except HAError as exc:
+                        logger.warning("Intercom tts.speak failed: %s", exc)
+
+                if self._sync_announce:
+                    _fire()
+                else:
+                    threading.Thread(target=_fire, name="intercom-tts", daemon=True).start()
+
+                if len(live) == 1:
+                    out = f"Announced to {live[0][0]}."
+                elif len(live) <= 3:
+                    out = f"Announced to {', '.join(rn for rn, _ in live)}."
+                else:
+                    out = f"Announced on {len(live)} speakers."
+                if dead:
+                    out += f" Skipped offline: {', '.join(dead[:3])}."
+                return out
+
+        # Fallback: assist_satellite.announce (pre-filtered for live satellites)
+        clean_msg = message.strip()
+        live_sat = [
             s["entity_id"]
             for s in states
             if s["entity_id"].startswith("assist_satellite.")
             and s["state"] not in _BAD_STATES
         ]
-        if not live:
+        if not live_sat:
             raise HAError("No available speaker to announce on.")
         self._post(
             "/api/services/assist_satellite/announce",
-            {"entity_id": live, "message": message, "preannounce": True},
+            {"entity_id": live_sat, "message": clean_msg, "preannounce": True},
         )
-        noun = "speaker" if len(live) == 1 else "speakers"
-        return f"Announced on {len(live)} {noun}."
+        noun = "speaker" if len(live_sat) == 1 else "speakers"
+        return f"Announced on {len(live_sat)} {noun}."
+
+    def routine(
+        self,
+        mode: str,
+        *,
+        calendar_fn: Callable[[str], str] | None = None,
+    ) -> str:
+        """Run a composite home routine: morning, goodnight, or leaving."""
+        if not self.token:
+            raise HAError("Routines unavailable: HASS_TOKEN not configured.")
+        m = norm_key(mode)
+        cfg = self._cfg()
+
+        def _turn_off_light_list(group_ids: tuple[str, ...], states: list[dict]) -> int:
+            if group_ids:
+                want = set(group_ids)
+                targets = [s["entity_id"] for s in states if s["entity_id"] in want and s.get("state") == "on"]
+            else:
+                targets = [
+                    s["entity_id"] for s in states
+                    if s["entity_id"].startswith("light.") and s.get("state") == "on"
+                ]
+            if not targets:
+                return 0
+            self._post("/api/services/light/turn_off", {"entity_id": targets})
+            return len(targets)
+
+        def _stop_playing_speakers(states: list[dict]) -> int:
+            configured = {s.ha_entity for s in cfg.rooms.values() if s.ha_entity}
+            targets = [
+                s["entity_id"] for s in states
+                if s.get("state") == "playing"
+                and (
+                    (configured and s["entity_id"] in configured)
+                    or (not configured and s["entity_id"].startswith("media_player.") and s["entity_id"].endswith("_2"))
+                )
+            ]
+            if not targets:
+                return 0
+            self._post("/api/services/media_player/media_stop", {"entity_id": targets})
+            return len(targets)
+
+        if m in ("morning", "good morning", "briefing", "morning briefing"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                f_wx = ex.submit(self.weather, "today")
+                f_cal = ex.submit(calendar_fn, "today") if calendar_fn else None
+                parts = []
+                try:
+                    parts.append(f_wx.result())
+                except HAError:
+                    pass
+                if f_cal:
+                    try:
+                        parts.append(f_cal.result())
+                    except Exception:
+                        pass
+            return " ".join(p for p in parts if p) or "Good morning."
+
+        if m in ("goodnight", "good night", "night", "bedtime"):
+            states = self._get("/api/states")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                f_l = ex.submit(_turn_off_light_list, cfg.common_light_groups, states)
+                f_m = ex.submit(_stop_playing_speakers, states)
+                f_wx = ex.submit(self.weather, "tomorrow")
+                f_cal = ex.submit(calendar_fn, "tomorrow") if calendar_fn else None
+                lc, mc = f_l.result(), f_m.result()
+                actions = []
+                if lc:
+                    actions.append(f"turned off {lc} light group{'s' if lc != 1 else ''}")
+                if mc:
+                    actions.append(f"stopped {mc} speaker{'s' if mc != 1 else ''}")
+                head = ("Goodnight: " + " and ".join(actions) + ".") if actions else "Goodnight: common lights and speakers are already off."
+                tail_parts = [head]
+                try:
+                    tail_parts.append(f_wx.result())
+                except HAError:
+                    pass
+                if f_cal:
+                    try:
+                        tail_parts.append(f_cal.result())
+                    except Exception:
+                        pass
+            return " ".join(tail_parts)
+
+        if m in ("leaving", "im leaving", "goodbye", "away"):
+            states = self._get("/api/states")
+            lc = _turn_off_light_list(cfg.all_light_groups, states)
+            mc = _stop_playing_speakers(states)
+            bits = []
+            if lc:
+                bits.append(f"{lc} light group{'s' if lc != 1 else ''}")
+            if mc:
+                bits.append(f"{mc} speaker{'s' if mc != 1 else ''}")
+            if bits:
+                return f"Shut down {' and '.join(bits)}. Have a good one."
+            return "All lights and speakers are already off. Have a good one."
+
+        raise HAError('Unknown routine; use "morning", "goodnight", or "leaving".')
 
     # -- music (Music Assistant players surfaced as media_player.*_2) --------
 
@@ -935,14 +1154,27 @@ class HAClient:
             new_items = self._split_todo_items(m_add.group(1))
             if not new_items:
                 raise HAError("Name an item to add to the shopping list.")
+            try:
+                existing = {it.lower() for it in self._get_todo_items()}
+            except HAError:
+                existing = set()
+            added: list[str] = []
+            skipped: list[str] = []
             for item in new_items:
-                self._post(
-                    "/api/services/todo/add_item",
-                    {"entity_id": self._TODO_ENTITY, "item": item},
-                )
-            if len(new_items) == 1:
-                return f"Added {new_items[0]} to the shopping list."
-            return f"Added {', '.join(new_items)} to the shopping list."
+                if item.lower() in existing:
+                    skipped.append(item)
+                else:
+                    self._post(
+                        "/api/services/todo/add_item",
+                        {"entity_id": self._TODO_ENTITY, "item": item},
+                    )
+                    added.append(item)
+                    existing.add(item.lower())
+            if added and skipped:
+                return f"Added {', '.join(added)}. Already on list: {', '.join(skipped)}."
+            if added:
+                return f"Added {', '.join(added)} to the shopping list."
+            return f"{', '.join(skipped)} {'is' if len(skipped) == 1 else 'are'} already on the shopping list."
 
         # Default: read current items
         items = self._get_todo_items()

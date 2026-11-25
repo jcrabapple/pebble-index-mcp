@@ -38,6 +38,8 @@ and the answer comes back as a phone notification.
 | `src/pebble_index_mcp/websearch.py` | `ExaClient`: live web search against the Exa API, snippets truncated locally. Errors map to `ExaError`; a missing key short-circuits with a clear message. |
 | `src/pebble_index_mcp/homeassistant.py` | `HAClient`: deterministic smart-home commands against the Home Assistant REST API. Parses the action from the command text, resolves the target entity by token match (preferring room group entities over individual fixtures and available over unavailable entities), calls the service, then polls the state readback to confirm. No LLM in the loop. Also `announce()`: intercom messages to every live `assist_satellite` (offline satellites are pre-filtered because HA returns 200 for announce regardless). |
 | `src/pebble_index_mcp/vinyl.py` | `VinylClient`: lookups against the operator's self-hosted vinyl catalog API. Routes command text to a random pick, most-played list, or artist/album search; conversational filler is stripped before the catalog's full-text query. Base URL is operator config only. |
+| `src/pebble_index_mcp/home_config.py` | `HomeConfigLoader`: mtime-cached loader for the shared `~/.config/home-voice/home.json` room, alias, intercom, routine, and ASR-correction map (template in `deploy/home.example.json`). |
+| `src/pebble_index_mcp/music_assistant.py` | `MusicAssistantClient`: direct Music Assistant HTTP JSON-RPC engine with smart search ranking (karaoke/cover filtering, library boost, clean artist top-tracks), queue/shuffle/repeat/favorite/transfer, and TV exclusion. |
 | `src/pebble_index_mcp/overseerr.py` | `OverseerrClient`: checks Plex availability, submits movie/TV requests (with per-season duplicate protection and `%20` query encoding), and lists recent requests with resolved titles. |
 | `src/pebble_index_mcp/calendar.py` | `CalendarClient`: queries the local `khal` Fastmail CalDAV mirror (with `RRULE` recurrence expansion) for today/tomorrow/weekday/7-day schedules and event keyword searches. |
 | `src/pebble_index_mcp/calc.py` | Deterministic AST arithmetic, unit conversions (temp, volume, mass, length), mead gravity ABV, tip/bill splits, coin flips, and dice rolls. |
@@ -93,9 +95,11 @@ Every user-facing tool wraps its result in the Pebble app's private `coreSchema`
 | `EXA_API_KEY` | — | Exa API key for `web_search` (primary if `TRIVET_URL` unset, automatic fallback if Trivet fails) |
 | `HASS_URL` | `http://127.0.0.1:8123` | Home Assistant base URL for `ha_*`, `shopping_list`, `weather_report` |
 | `HASS_TOKEN` | — | Home Assistant long-lived access token; without it HA tools report a clear config error |
-| `HASS_MUSIC_ROOMS` | — | Optional comma-separated `room=media_player.entity` aliases for `ha_music` (supplementing dynamic HA discovery) |
-| `HASS_DEFAULT_PLAYER` | — | Optional comma-separated fallback list of default `media_player.*` entity IDs when no room is named |
-| `KHAL_BIN` | auto | Optional explicit path to the `khal` binary for `calendar_lookup` |
+| `HASS_MUSIC_ROOMS` | — | Optional comma-separated `room=media_player.entity` aliases for fallback HA music |
+| `HASS_DEFAULT_PLAYER` | — | Optional comma-separated fallback list of default `media_player.*` entity IDs |
+| `HOME_VOICE_CONFIG` | `~/.config/home-voice/home.json` | Optional shared JSON config for rooms, MA player IDs, person aliases, intercom, routines, and ASR corrections (`deploy/home.example.json`) |
+| `MASS_SERVER_URL` / `MASS_ACCESS_TOKEN` | — | Music Assistant server URL and token for direct JSON-RPC `ha_music` (falls back to HA `play_media` if unset) |
+| `KHAL_BIN` / `VDIRSYNCER_BIN` | auto | Optional paths for `calendar_lookup` and stale-mirror auto-sync (`CALENDAR_STORE`, `CALENDAR_AUTO_SYNC=0` to disable) |
 | `ENABLE_ASK_HERMES` | `0` | Set to `1` to register the legacy `ask_hermes` tool (leave off to use `respond`) |
 | `VINYL_URL` | — | Base URL of a vinyl catalog API exposing `GET /api/records?q=`, `GET /api/random`, `GET /api/plays/top` for `vinyl_lookup`; without it the tool reports an error but the rest of the server works |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | — | Overseerr base URL and API key for `plex_media` (Plex availability checks and download requests) |

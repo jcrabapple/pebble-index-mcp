@@ -90,6 +90,33 @@ def test_calendar_search_filters_past_and_sorts_chronologically(monkeypatch):
 
 
 def test_calendar_missing_binary_raises():
-    c = CalendarClient(khal_bin="/nonexistent/khal-binary")
+    c = CalendarClient(khal_bin="/nonexistent/khal-binary", auto_sync=False)
     with pytest.raises(CalendarError):
         c.lookup("today")
+
+
+def test_calendar_syncs_when_mirror_stale(monkeypatch, tmp_path):
+    import os
+    import time
+
+    ics = tmp_path / "ev.ics"
+    ics.write_text("BEGIN:VCALENDAR\nEND:VCALENDAR\n")
+    old_ts = time.time() - 3600  # 60 min old > 20 min threshold
+    os.utime(ics, (old_ts, old_ts))
+
+    ran = []
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_subproc(cmd, **kw):
+        ran.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr("pebble_index_mcp.calendar.subprocess.run", fake_subproc)
+    c = CalendarClient(khal_bin="/bin/khal", store_dir=tmp_path, vdirsyncer_bin="/bin/vdirsyncer", stale_minutes=20)
+    c.lookup("today")
+    assert ran[0] == ["/bin/vdirsyncer", "sync"]
+    assert ran[1][0] == "/bin/khal"

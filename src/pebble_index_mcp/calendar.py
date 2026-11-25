@@ -6,11 +6,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 _TIMEOUT = 10.0
 _MAX_DAYS = 5
 _MAX_SEARCH_HITS = 5
+_DEFAULT_STALE_MIN = 20.0
+_SYNC_TIMEOUT_S = 15.0
 
 _WEEKDAYS = {
     "monday": 0,
@@ -97,12 +100,70 @@ def _default_khal_bin() -> str:
     return shutil.which("khal") or "khal"
 
 
+def _default_vdirsyncer_bin() -> str:
+    env_bin = os.environ.get("VDIRSYNCER_BIN", "").strip()
+    if env_bin:
+        return env_bin
+    local_bin = Path.home() / ".local" / "bin" / "vdirsyncer"
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    return shutil.which("vdirsyncer") or ""
+
+
 class CalendarClient:
-    def __init__(self, khal_bin: str = "", timeout: float = _TIMEOUT):
+    def __init__(
+        self,
+        khal_bin: str = "",
+        timeout: float = _TIMEOUT,
+        store_dir: str | Path | None = None,
+        vdirsyncer_bin: str = "",
+        stale_minutes: float = _DEFAULT_STALE_MIN,
+        auto_sync: bool = True,
+    ):
         self.khal_bin = khal_bin or _default_khal_bin()
         self.timeout = timeout
+        if store_dir is not None:
+            self.store_dir: Path | None = Path(store_dir)
+        else:
+            env_store = os.environ.get("CALENDAR_STORE", "").strip()
+            default_store = Path.home() / ".local" / "share" / "oscar" / "calendars"
+            self.store_dir = Path(env_store).expanduser() if env_store else (default_store if default_store.is_dir() else None)
+        self.vdirsyncer_bin = vdirsyncer_bin or _default_vdirsyncer_bin()
+        self.stale_minutes = stale_minutes
+        self.auto_sync = auto_sync and os.environ.get("CALENDAR_AUTO_SYNC", "1").strip() not in ("0", "false", "no")
+
+    def _mirror_age_minutes(self) -> float:
+        if not self.store_dir or not self.store_dir.is_dir():
+            return 0.0
+        newest = 0.0
+        try:
+            for path in self.store_dir.rglob("*.ics"):
+                newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            return 0.0
+        if not newest:
+            return float("inf")
+        return (time.time() - newest) / 60.0
+
+    def _sync_if_stale(self) -> None:
+        if not self.auto_sync or not self.vdirsyncer_bin or not self.store_dir:
+            return
+        if self._mirror_age_minutes() < self.stale_minutes:
+            return
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        try:
+            subprocess.run(
+                [self.vdirsyncer_bin, "sync"],
+                capture_output=True,
+                timeout=_SYNC_TIMEOUT_S,
+                env=env,
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass  # cached events are better than failing the turn
 
     def _run(self, args: list[str]) -> str:
+        self._sync_if_stale()
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
         try:

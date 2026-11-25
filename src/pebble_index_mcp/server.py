@@ -21,7 +21,9 @@ from starlette.responses import JSONResponse
 from .calc import CalcError, evaluate as eval_calc
 from .calendar import CalendarClient, CalendarError
 from .hermes import HermesClient, HermesError, HermesTimeout
+from .home_config import HomeConfigLoader
 from .homeassistant import HAClient, HAError, parse_music_rooms_env
+from .music_assistant import MAError, MusicAssistantClient
 from .overseerr import OverseerrClient, OverseerrError
 from .vault import Vault, VaultAccessError
 from .vinyl import VinylClient, VinylError
@@ -72,14 +74,21 @@ if os.environ.get("HERMES_AGENT_API_URL", "").strip():
     )
 if not TRIVET.url and not EXA.api_key:
     logger.warning("Neither TRIVET_URL nor EXA_API_KEY is set; web_search will report an error")
+HOME_CONFIG = HomeConfigLoader()
 HA = HAClient(
     url=os.environ.get("HASS_URL", "http://127.0.0.1:8123"),
     token=os.environ.get("HASS_TOKEN", ""),
     music_rooms=parse_music_rooms_env(os.environ.get("HASS_MUSIC_ROOMS", "")),
     default_players=os.environ.get("HASS_DEFAULT_PLAYER", ""),
+    home_config=HOME_CONFIG,
 )
 if not HA.token:
-    logger.warning("HASS_TOKEN is not set; ha_control will report an error")
+    logger.warning("HASS_TOKEN is not set; smart_home will report an error")
+MA = MusicAssistantClient(
+    url=os.environ.get("MASS_SERVER_URL", "").strip(),
+    token=os.environ.get("MASS_ACCESS_TOKEN", "").strip(),
+    home_config=HOME_CONFIG,
+)
 VINYL = VinylClient(url=os.environ.get("VINYL_URL", "").strip())
 if not VINYL.url:
     logger.warning("VINYL_URL is not set; vinyl_lookup will report an error")
@@ -203,13 +212,14 @@ def _spoken_response(text: str, question: str | None = None) -> CallToolResult:
 
 
 @mcp.tool()
-def web_search(query: str, max_results: int = 3) -> CallToolResult:
+def web_search(query: str, max_results: int = 3, compose: bool = True) -> CallToolResult:
     """Search the live web for current information.
 
     Use for news, sports scores, prices, schedules, recent events, or anything
     that changes over time. Prefers self-hosted Trivet metasearch when
-    configured (falling back to Exa), then composes a short spoken answer.
-    For local weather prefer weather_report; for notes prefer vault_search.
+    configured (falling back to Exa), then composes a short spoken answer
+    (set compose=False for agent clients that summarize results themselves).
+    For local weather prefer weather_report; for notes prefer vault.
     """
     started = time.perf_counter()
     backend = "exa"
@@ -233,6 +243,9 @@ def web_search(query: str, max_results: int = 3) -> CallToolResult:
             content=[TextContent(type="text", text=f"Web search unavailable ({e})")]
         )
     search_done = time.perf_counter()
+    if not compose:
+        logger.info("web_search backend=%s compose=skip search=%.3fs", backend, search_done - started)
+        return CallToolResult(content=[TextContent(type="text", text=results)])
     try:
         answer = HERMES.compose_answer(query, results)
     except (HermesTimeout, HermesError):
@@ -310,29 +323,35 @@ if HERMES_AGENT is not None:
 
 
 @mcp.tool()
-def smart_home(action: str, command: str) -> CallToolResult:
-    """Control Home Assistant devices/scenes or make a house intercom announcement.
+def smart_home(action: str, command: str, target: str = "") -> CallToolResult:
+    """Control Home Assistant devices/scenes, run routines, or make intercom announcements.
 
     action:
     - "control": lights, Hue scenes, dimming, all lights off/on, switches,
       fans, covers, TVs. Pass the spoken command (e.g. "living room lights
       on", "dim living room to 30%", "set basement to relax", "all lights
       off", "is the hallway light on").
-    - "announce": intercom announcement on live house speaker(s). Pass ONLY
-      the words to speak (e.g. "dinner is ready").
+    - "announce": intercom announcement on room/person speaker(s) or everyone.
+      Pass the message in command and optional room/person in target (e.g.
+      target="sydney", command="dinner is ready"; or target="everyone").
+    - "routine": composite home routine; command is "morning", "goodnight",
+      or "leaving".
     """
     started = time.perf_counter()
     act = (action or "").strip().lower()
     try:
         if act == "announce":
-            text = HA.announce(command)
+            text = HA.announce(command, target=target)
             _log_tool("smart_home:announce", started, ok=True)
+        elif act == "routine":
+            text = HA.routine(command, calendar_fn=CALENDAR.lookup)
+            _log_tool("smart_home:routine", started, ok=True)
         elif act in ("control", ""):
             text = HA.control(command)
             _log_tool("smart_home:control", started, ok=True)
         else:
             _log_tool("smart_home", started, ok=False, detail=f"unknown action {act}")
-            return _spoken_response('Unknown smart_home action; use "control" or "announce".')
+            return _spoken_response('Unknown smart_home action; use "control", "announce", or "routine".')
     except HAError as e:
         _log_tool(f"smart_home:{act or 'control'}", started, ok=False, detail=str(e))
         return _spoken_response(str(e), question=command)
@@ -398,18 +417,24 @@ def vinyl_lookup(command: str) -> CallToolResult:
 
 @mcp.tool()
 def ha_music(command: str) -> CallToolResult:
-    """Play, control, or query music on the house speakers (Deezer via Music Assistant).
+    """Play, control, queue, or query music on the house speakers (Music Assistant / Deezer).
 
-    Use for playback ("play Spiritbox in the basement", "play the album Blue
-    Rev in the kitchen"), transport ("pause", "resume", "skip", "previous",
-    "stop the music"), volume ("volume 40 in the basement", "turn it down",
-    "mute kitchen"), or status ("what's playing"). No room named uses the
-    active playing speaker or default speaker."""
+    Use for playback ("play Spiritbox in the basement", "shuffle Sleep Token",
+    "play the album Blue Rev in the kitchen", "play Bilmuri radio"), queueing
+    ("queue Granite next"), transport ("pause", "resume", "skip", "previous",
+    "stop everywhere"), volume ("volume 40 in the basement", "turn it down",
+    "mute kitchen"), queue/library ("what's playing", "what's up next",
+    "favorite this song", "transfer music to kitchen"). Prefers direct Music
+    Assistant JSON-RPC when configured, falling back to Home Assistant."""
     started = time.perf_counter()
     try:
-        text = HA.music(command)
-        _log_tool("ha_music", started, ok=True)
-    except HAError as e:
+        if MA.configured:
+            text = MA.command(command)
+            _log_tool("ha_music:ma", started, ok=True)
+        else:
+            text = HA.music(command)
+            _log_tool("ha_music:ha", started, ok=True)
+    except (MAError, HAError) as e:
         _log_tool("ha_music", started, ok=False, detail=str(e))
         return _spoken_response(str(e), question=command)
     return _spoken_response(text, question=command)

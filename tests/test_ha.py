@@ -551,7 +551,8 @@ def test_shopping_list_add_strips_tail(monkeypatch):
     calls = []
     monkeypatch.setattr(c, "_post", lambda path, payload: calls.append((path, payload)) or [])
     out = c.shopping_list("add some oat milk to the shopping list")
-    assert calls[0] == (
+    add_calls = [(p, d) for p, d in calls if "add_item" in p]
+    assert add_calls[0] == (
         "/api/services/todo/add_item",
         {"entity_id": "todo.shopping_list", "item": "oat milk"},
     )
@@ -615,7 +616,8 @@ def test_shopping_list_add_multiple_and_need_phrasing(monkeypatch):
     calls = []
     monkeypatch.setattr(c, "_post", lambda path, payload: calls.append((path, payload)) or [])
     out = c.shopping_list("we need milk and eggs")
-    assert [p["item"] for _, p in calls] == ["milk", "eggs"]
+    add_items = [p["item"] for path, p in calls if "add_item" in path]
+    assert add_items == ["milk", "eggs"]
     assert out == "Added milk, eggs to the shopping list."
 
 
@@ -624,8 +626,29 @@ def test_shopping_list_keeps_compound_grocery_item(monkeypatch):
     calls = []
     monkeypatch.setattr(c, "_post", lambda path, payload: calls.append((path, payload)) or [])
     out = c.shopping_list("add mac and cheese to the shopping list")
-    assert [p["item"] for _, p in calls] == ["mac and cheese"]
+    add_items = [p["item"] for path, p in calls if "add_item" in path]
+    assert add_items == ["mac and cheese"]
     assert out == "Added mac and cheese to the shopping list."
+
+
+def test_shopping_list_dedupes_existing_items(monkeypatch):
+    c = _client()
+    calls = []
+
+    def fake_post(path, payload):
+        calls.append((path, payload))
+        if "get_items" in path:
+            return {"service_response": {"todo.shopping_list": {"items": [{"summary": "Milk"}]}}}
+        return []
+
+    monkeypatch.setattr(c, "_post", fake_post)
+    out = c.shopping_list("add milk and eggs")
+    add_items = [p["item"] for path, p in calls if "add_item" in path]
+    assert add_items == ["eggs"]
+    assert "Added eggs" in out and "Milk" in out or "milk" in out
+
+    out2 = c.shopping_list("add milk")
+    assert "already on the shopping list" in out2
 
 
 # --- weather ---------------------------------------------------------------
@@ -944,3 +967,80 @@ def test_weather_feels_like_gusts_and_hourly(monkeypatch):
     # Umbrella / rain query scans hourly window
     rain_out = c.weather("do I need an umbrella tonight")
     assert "rainy starting around" in rain_out and "gusts to 28 mph" in rain_out
+
+
+def test_intercom_ma_rooms_and_everyone_exclusion(monkeypatch):
+    from pebble_index_mcp.home_config import parse_home_config
+
+    cfg = parse_home_config(
+        {
+            "rooms": {
+                "basement": {"ha_entity": "media_player.base_2", "ma_player_id": "p1"},
+                "kitchen": {"ha_entity": "media_player.kit_2", "ma_player_id": "p2"},
+                "away room": {"ha_entity": "media_player.away_2", "ma_player_id": "p3"},
+            },
+            "aliases": {"downstairs": "basement"},
+            "intercom": {"tts_entity": "tts.harper", "voice": "en-GB-Ollie", "everyone_exclude": ["away room"]},
+        }
+    )
+    c = _client(home_config=cfg, sync_announce=True)
+    posts = []
+    states = [
+        _mu_state("media_player.base_2", "idle"),
+        _mu_state("media_player.kit_2", "idle"),
+        _mu_state("media_player.away_2", "idle"),
+    ]
+    monkeypatch.setattr(c, "_get", lambda path: states)
+    monkeypatch.setattr(c, "_post", lambda path, payload: posts.append((path, payload)) or [])
+
+    # Person/room alias via natural phrase
+    out = c.announce("tell downstairs dinner is ready")
+    assert out == "Announced to basement."
+    assert posts[0] == (
+        "/api/services/tts/speak",
+        {
+            "entity_id": "tts.harper",
+            "media_player_entity_id": ["media_player.base_2"],
+            "message": "dinner is ready",
+            "options": {"voice": "en-GB-Ollie"},
+        },
+    )
+
+    # Everyone skips excluded room
+    out_all = c.announce("dinner is ready", target="everyone")
+    assert "basement" in out_all and "kitchen" in out_all and "away room" not in out_all
+    assert posts[1][1]["media_player_entity_id"] == ["media_player.base_2", "media_player.kit_2"]
+
+
+def test_routine_goodnight_and_leaving(monkeypatch):
+    from pebble_index_mcp.home_config import parse_home_config
+
+    cfg = parse_home_config(
+        {
+            "rooms": {"basement": {"ha_entity": "media_player.base_2"}},
+            "routines": {
+                "common_light_groups": ["light.living_room_living_room"],
+                "all_light_groups": ["light.living_room_living_room", "light.bedroom_bedroom_2"],
+            },
+        }
+    )
+    c = _client(home_config=cfg)
+    posts = []
+    states = [
+        _state("light.living_room_living_room", "Living Room", "on"),
+        _state("light.bedroom_bedroom_2", "Bedroom", "on"),
+        _mu_state("media_player.base_2", "playing"),
+    ]
+    monkeypatch.setattr(c, "_get", lambda path: states)
+    monkeypatch.setattr(c, "_post", lambda path, payload: posts.append((path, payload)) or [])
+    monkeypatch.setattr(c, "weather", lambda q: "Tomorrow: sunny, high 60°F.")
+
+    out_gn = c.routine("goodnight", calendar_fn=lambda q: "Nothing on the calendar for tomorrow.")
+    assert "turned off 1 light group" in out_gn and "stopped 1 speaker" in out_gn
+    assert "Tomorrow: sunny" in out_gn
+    # Goodnight keeps bedroom on
+    assert posts[0][1]["entity_id"] == ["light.living_room_living_room"]
+
+    posts.clear()
+    out_lv = c.routine("leaving")
+    assert "2 light groups" in out_lv and "1 speaker" in out_lv
